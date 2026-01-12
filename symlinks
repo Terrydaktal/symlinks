@@ -145,10 +145,12 @@ if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
           [[ "$link" == "$folder_abs" || "$link" == "$folder_abs"/* ]] && continue
           
           # We use fully resolved path to see if it eventually points to our folder
-          resolved=$(realpath -m "$link")
+          resolved=$(realpath -m "$link" 2>/dev/null || true)
+          [[ -z "$resolved" ]] && continue
           
           if [[ "$resolved" == "$folder_abs" || "$resolved" == "$folder_abs"/* ]]; then
-            raw=$(readlink "$link")
+            raw=$(readlink "$link" || true)
+            [[ -z "$raw" ]] && continue
             printf "${BLUE}%s${NC} -> ${YELLOW}%s${NC} (${CYAN}resolved: %s${NC}) ${BOLD}${RED}[BROKEN IF MOVED]${NC}\n" "$link" "$raw" "$resolved"
           fi
         done
