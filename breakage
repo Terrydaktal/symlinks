@@ -79,12 +79,18 @@ echo
 
 # 1. Absolute Path Matches
 echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
+# Common source extensions
+SRC_GLOBS="*.{c,cpp,h,hpp,js,ts,py,rs,go,java,sh,rb,php,md,html,css,json,yaml,yml,toml}"
+
 if [[ -n "$RG_BIN" ]]; then
-  # Use ripgrep for speed and nice output
-  $RG_BIN --fixed-strings --color=always --line-number "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
+  # Use ripgrep with glob filtering
+  $RG_BIN --fixed-strings --color=always --line-number -g "$SRC_GLOBS" \
+    "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
 else
-  # Fallback to grep
-  grep -rnF --color=always "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
+  # Fallback to grep with include (note: grep --include doesn't always support brace expansion in all versions, 
+  # so we use a more compatible loop or multiple --include if needed, but modern bash/grep usually handles this)
+  grep -rnF --color=always --include="$SRC_GLOBS" \
+    "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
 fi
 
 echo
@@ -93,16 +99,13 @@ echo
 echo -e "${BOLD}${BLUE}2) Relative or named references to '${FOLDER_NAME}'${NC}"
 echo -e "${CYAN}(Looking for occurrences of the folder name in path-like strings)${NC}"
 
-# We want to find the folder name when it's part of a path.
-# Pattern: \bFOLDER_NAME\b surrounded by / or quotes, or at start of string.
-# This regex tries to find FOLDER_NAME as a path component.
 if [[ -n "$RG_BIN" ]]; then
-  # Regex: (path separator or quote)FOLDER_NAME(path separator or quote or end of string)
-  # Or start of line FOLDER_NAME
-  $RG_BIN --color=always --line-number "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
+  $RG_BIN --color=always --line-number -g "$SRC_GLOBS" \
+    "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
     --glob "!**/${FOLDER_NAME}/**" || echo -e "${YELLOW}No relative/named matches found.${NC}"
 else
-  grep -rnE --color=always "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
+  grep -rnE --color=always --include="$SRC_GLOBS" \
+    "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
     --exclude-dir="$FOLDER_NAME" || echo -e "${YELLOW}No relative/named matches found.${NC}"
 fi
 
