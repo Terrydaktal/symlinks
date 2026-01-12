@@ -82,14 +82,33 @@ echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
 # Common source extensions
 SRC_GLOBS="*.{c,cpp,h,hpp,js,ts,py,rs,go,java,sh,rb,php,md,html,css,json,yaml,yml,toml}"
 
+# Exclusions for large/system directories
+EXCLUDES=(
+  "proc" "sys" "dev" "run" "mnt" "tmp" 
+  ".git" ".cache" "node_modules" "venv" ".venv" "target"
+)
+
 if [[ -n "$RG_BIN" ]]; then
-  # Use ripgrep with glob filtering
+  # Build rg glob exclusions
+  RG_EXCLUDES=()
+  for x in "${EXCLUDES[@]}"; do
+    RG_EXCLUDES+=(--glob "!**/$x/**")
+  done
+
+  # Use ripgrep with glob filtering and exclusions
   $RG_BIN --fixed-strings --color=always --line-number -g "$SRC_GLOBS" \
+    "${RG_EXCLUDES[@]}" \
     "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
 else
-  # Fallback to grep with include (note: grep --include doesn't always support brace expansion in all versions, 
-  # so we use a more compatible loop or multiple --include if needed, but modern bash/grep usually handles this)
+  # Build grep exclude-dir flags
+  GREP_EXCLUDES=()
+  for x in "${EXCLUDES[@]}"; do
+    GREP_EXCLUDES+=(--exclude-dir="$x")
+  done
+
+  # Fallback to grep with include and exclusions
   grep -rnF --color=always --include="$SRC_GLOBS" \
+    "${GREP_EXCLUDES[@]}" \
     "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
 fi
 
@@ -101,10 +120,12 @@ echo -e "${CYAN}(Looking for occurrences of the folder name in path-like strings
 
 if [[ -n "$RG_BIN" ]]; then
   $RG_BIN --color=always --line-number -g "$SRC_GLOBS" \
+    "${RG_EXCLUDES[@]}" \
     "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
     --glob "!**/${FOLDER_NAME}/**" || echo -e "${YELLOW}No relative/named matches found.${NC}"
 else
   grep -rnE --color=always --include="$SRC_GLOBS" \
+    "${GREP_EXCLUDES[@]}" \
     "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
     --exclude-dir="$FOLDER_NAME" || echo -e "${YELLOW}No relative/named matches found.${NC}"
 fi
