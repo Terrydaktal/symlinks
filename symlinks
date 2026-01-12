@@ -118,22 +118,28 @@ if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
     "${sudo_prefix[@]}" "$FD_BIN" -t l -H "$SCAN_ROOT_ABS" \
       -E proc -E sys -E dev -E run -E mnt -E tmp -E .git -E .cache -E node_modules \
       -x bash -c '
+        folder_abs="$1"; shift
+        BLUE="\033[0;34m"
+        YELLOW="\033[1;33m"
+        CYAN="\033[0;36m"
+        NC="\033[0m"
         for link in "$@"; do
-          # Skip links that are inside the folder itself
-          [[ "$link" == "$FOLDER_ABS" || "$link" == "$FOLDER_ABS"/* ]] && continue
+          [[ "$link" == "$folder_abs" || "$link" == "$folder_abs"/* ]] && continue
           
           raw=$(readlink "$link")
+          [[ -z "$raw" ]] && continue
+          
           if [[ "$raw" != /* ]]; then
             resolved=$(realpath -m "$(dirname "$link")/$raw")
           else
             resolved=$(realpath -m "$raw")
           fi
           
-          if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-            print_link "$link" "$raw" "$resolved" "$BLUE"
+          if [[ "$resolved" == "$folder_abs" || "$resolved" == "$folder_abs"/* ]]; then
+            printf "${BLUE}%s${NC} -> ${YELLOW}%s${NC} (${CYAN}resolved: %s${NC})\n" "$link" "$raw" "$resolved"
           fi
         done
-      ' bash {} + 2>/dev/null
+      ' bash "$FOLDER_ABS" {} +
     echo
   fi
 fi
