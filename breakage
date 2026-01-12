@@ -91,16 +91,7 @@ EXCLUDES=("proc" "sys" "dev" "run" "mnt" "tmp" ".git" ".cache" "node_modules" "v
 SUDO_CMD=()
 [[ "$USE_SUDO" -eq 1 ]] && SUDO_CMD=(sudo)
 
-echo -e "${BOLD}${PURPLE}== Analyzing potential breakage for moving: ${FOLDER_ABS} ==${NC}"
-[[ -n "$FOLDER_HOME_ALT" ]] && echo -e "${CYAN}(Also checking for: ${FOLDER_HOME_ALT})${NC}"
-echo -e "${CYAN}(Searching in: ${SEARCH_PATH} | Filter: $( [[ $USE_FILTER -eq 1 ]] && echo "Enabled" || echo "Disabled" ))${NC}"
-echo
-
-# 1. Absolute Path Matches
-echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
-HAS_ABS=0
-
-# Build exclusion flags for rg/grep
+# Exclusions flags
 RG_EXCLUDE_FLAGS=()
 GREP_EXCLUDE_FLAGS=()
 for x in "${EXCLUDES[@]}"; do
@@ -108,18 +99,80 @@ for x in "${EXCLUDES[@]}"; do
   GREP_EXCLUDE_FLAGS+=("--exclude-dir=$x")
 done
 
+echo -e "${BOLD}${PURPLE}== Analyzing potential breakage for moving: ${FOLDER_ABS} ==${NC}"
+[[ -n "$FOLDER_HOME_ALT" ]] && echo -e "${CYAN}(Also checking for: ${FOLDER_HOME_ALT})${NC}"
+echo -e "${CYAN}(Searching in: ${SEARCH_PATH} | Filter: $( [[ $USE_FILTER -eq 1 ]] && echo "Enabled" || echo "Disabled" ))${NC}"
+echo
+
+# Python helper for extraction AND context truncation
+PY_HELPER=$(mktemp)
+cat <<'EOF' > "$PY_HELPER"
+import sys, re
+
+mode = sys.argv[1] # 'extract' or 'truncate'
+name_or_patt = sys.argv[2]
+line = sys.stdin.read().strip()
+
+if mode == 'extract':
+    results = set()
+    # Match anything in quotes (handle both hex-safe)
+    for m in re.finditer(r"(['\x22])(.*?)\1", line):
+        if name_or_patt in m.group(2): results.add(m.group(2))
+    # Match words
+    for word in re.split(r"[ \x22'():\[\]{}<>|,;]", line):
+        if name_or_patt in word: results.add(word)
+    for r in sorted(list(results)):
+        if r: sys.stdout.write(r + '\n')
+
+elif mode == 'truncate':
+    idx = line.find(name_or_patt)
+    if idx == -1:
+        # Fallback to just the first 100 chars
+        sys.stdout.write(line[:100] + "...\n")
+    else:
+        # Get ~40 chars on each side
+        start = max(0, idx - 40)
+        end = min(len(line), idx + len(name_or_patt) + 40)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(line) else ""
+        sys.stdout.write(f"{prefix}{line[start:end]}{suffix}\n")
+EOF
+trap 'rm -f "$PY_HELPER"' EXIT
+
+truncate_line() {
+  local content="$1"
+  local patt="$2"
+  echo "$content" | python3 "$PY_HELPER" truncate "$patt"
+}
+
+# 1. Absolute Path Matches
+echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
+HAS_ABS=0
+
 if [[ -n "$RG_BIN" ]]; then
-  RG_ABS_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=always" "--line-number" "--no-messages" "--fixed-strings")
+  RG_ABS_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=never" "--no-messages" "--fixed-strings" "--vimgrep")
   [[ "$USE_FILTER" -eq 1 ]] && RG_ABS_ARGS+=("-g" "$SRC_GLOBS")
   
-  "${SUDO_CMD[@]}" "$RG_BIN" "${RG_ABS_ARGS[@]}" \
-    -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" && HAS_ABS=1 || true
+  while IFS=: read -r file line_num _ line_content; do
+    HAS_ABS=1
+    patt="$FOLDER_ABS"
+    [[ "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
+    
+    snippet=$(truncate_line "$line_content" "$patt")
+    echo -e "${GREEN}$file:$line_num${NC}: $snippet"
+  done < <("${SUDO_CMD[@]}" "$RG_BIN" "${RG_ABS_ARGS[@]}" -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" 2>/dev/null || true)
 else
-  GREP_ABS_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=always" "-F")
+  GREP_ABS_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=never" "-F")
   [[ "$USE_FILTER" -eq 1 ]] && GREP_ABS_ARGS+=("--include=$SRC_GLOBS")
   
-  "${SUDO_CMD[@]}" grep "${GREP_ABS_ARGS[@]}" \
-    -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" && HAS_ABS=1 || true
+  while IFS=: read -r file line_num line_content; do
+    HAS_ABS=1
+    patt="$FOLDER_ABS"
+    [[ "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
+    
+    snippet=$(truncate_line "$line_content" "$patt")
+    echo -e "${GREEN}$file:$line_num${NC}: $snippet"
+  done < <("${SUDO_CMD[@]}" grep "${GREP_ABS_ARGS[@]}" -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" 2>/dev/null || true)
 fi
 [[ $HAS_ABS -eq 0 ]] && echo -e "${YELLOW}No absolute path matches found.${NC}"
 
@@ -127,36 +180,18 @@ echo
 echo -e "${BOLD}${BLUE}2) Confirmed relative references to '${FOLDER_NAME}'${NC}"
 echo -e "${CYAN}(Verifying if paths actually resolve to the target directory)${NC}"
 
-PY_EXTRACTOR=$(mktemp)
-cat <<'EOF' > "$PY_EXTRACTOR"
-import sys, re
-name = sys.argv[1]
-line = sys.stdin.read()
-results = set()
-# Match anything in quotes (handle both hex-safe)
-for m in re.finditer(r"(['\x22])(.*?)\1", line):
-    if name in m.group(2): results.add(m.group(2))
-# Match words
-for word in re.split(r"[ \x22'():\[\]{}<>|,;]", line):
-    if name in word: results.add(word)
-for r in sorted(list(results)):
-    if r: sys.stdout.write(r + '\n')
-EOF
-trap 'rm -f "$PY_EXTRACTOR"' EXIT
-
 process_hit() {
   local file="$1" line_num="$2" line_content="$3"
   local file_dir="$(dirname "$file")"
   [[ "$file_dir" != /* ]] && file_dir="$PWD/$file_dir"
 
-  # potentials from clean content
   local potentials=""
-  potentials=$(echo "$line_content" | python3 "$PY_EXTRACTOR" "$FOLDER_NAME" 2>/dev/null || true)
+  potentials=$(echo "$line_content" | python3 "$PY_HELPER" extract "$FOLDER_NAME" 2>/dev/null || true)
 
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     local resolved=""
-    if [[ "$p" == "~/"* ]]; then resolved="$(resolve_path "${p/#\~/$HOME}")"
+    if [[ "$p" == "~/*" ]]; then resolved="$(resolve_path "${p/#	/$HOME}")"
     elif [[ "$p" == /* ]]; then resolved="$(resolve_path "$p")"
     else
       if [[ "$p" == "$FOLDER_NAME" ]]; then
@@ -167,15 +202,14 @@ process_hit() {
       resolved="$(resolve_path "$file_dir/$p")"
     fi
     if [[ -n "$resolved" ]] && [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-      # Print with color for user, but process_hit got clean inputs
-      echo -e "${GREEN}$file:$line_num${NC}: $line_content ${BOLD}${GREEN}[CONFIRMED]${NC} (via: $p)"
+      snippet=$(truncate_line "$line_content" "$p")
+      echo -e "${GREEN}$file:$line_num${NC}: $snippet ${BOLD}${GREEN}[CONFIRMED]${NC} (via: $p)"
       break
     fi
   done <<< "$potentials"
 }
 
 MAX_HITS=5000; hit_count=0
-# IMPORTANT: For section 2 we use --color=never to ensure we parse clean text
 if [[ -n "$RG_BIN" ]]; then
   RG_REL_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=never" "--no-messages" "-w" "$FOLDER_NAME" "--vimgrep" "--glob" "!**/${FOLDER_NAME}/**")
   [[ "$USE_FILTER" -eq 1 ]] && RG_REL_ARGS+=("-g" "$SRC_GLOBS")
@@ -191,7 +225,7 @@ else
   while IFS=: read -r file line_num line_content; do
     process_hit "$file" "$line_num" "$line_content"
     ((hit_count++)); [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
-  done < <("${SUDO_CMD[@]}" grep "${GREP_REL_FLAGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
+  done < <("${SUDO_CMD[@]}" grep "${GREP_REL_ARGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
 fi
 
 echo; echo -e "${BOLD}${GREEN}Done.${NC}"
