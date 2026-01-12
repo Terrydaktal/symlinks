@@ -86,6 +86,14 @@ PY
   fi
 }
 
+# Normalize path without following symlinks
+normalize_path_no_follow() {
+  python3 - <<'PY' "$1"
+import os, sys
+print(os.path.normpath(sys.argv[1]))
+PY
+}
+
 FOLDER_ABS="$(resolve_path "$FOLDER")"
 export FOLDER_ABS
 SCAN_ROOT_ABS="$(resolve_path "$SCAN_ROOT")"
@@ -161,19 +169,17 @@ find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; 
   raw="$(readlink -- "$link" || true)"
   [[ -z "$raw" ]] && continue
   
-  is_absolute=0
-  [[ "$raw" == /* ]] && is_absolute=1
-  
-  if [[ "$is_absolute" -eq 1 ]]; then
-    resolved="$(resolve_path "$raw")"
+  if [[ "$raw" == /* ]]; then
+    immediate_target="$raw"
   else
-    resolved="$(resolve_path "$(dirname -- "$link")/$raw")"
+    immediate_target="$(dirname "$link")/$raw"
   fi
+  normalized_target=$(normalize_path_no_follow "$immediate_target")
 
-  # Check if resolved path is INSIDE the folder
-  if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
+  if [[ "$normalized_target" == "$FOLDER_ABS" || "$normalized_target" == "$FOLDER_ABS"/* ]]; then
+    resolved="$(resolve_path "$link")"
     is_broken=0
-    [[ "$is_absolute" -eq 1 ]] && is_broken=1
+    [[ "$raw" == /* ]] && is_broken=1
     print_link "$link" "$raw" "$resolved" "$GREEN" "$is_broken"
   fi
 done
@@ -186,19 +192,17 @@ find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; 
   raw="$(readlink -- "$link" || true)"
   [[ -z "$raw" ]] && continue
 
-  is_absolute=0
-  [[ "$raw" == /* ]] && is_absolute=1
-  
-  if [[ "$is_absolute" -eq 1 ]]; then
-    resolved="$(resolve_path "$raw")"
+  if [[ "$raw" == /* ]]; then
+    immediate_target="$raw"
   else
-    resolved="$(resolve_path "$(dirname -- "$link")/$raw")"
+    immediate_target="$(dirname "$link")/$raw"
   fi
+  normalized_target=$(normalize_path_no_follow "$immediate_target")
 
-  # Check if resolved path is OUTSIDE the folder
-  if [[ "$resolved" != "$FOLDER_ABS" && "$resolved" != "$FOLDER_ABS"/* ]]; then
+  if [[ "$normalized_target" != "$FOLDER_ABS" && "$normalized_target" != "$FOLDER_ABS"/* ]]; then
+    resolved="$(resolve_path "$link")"
     is_broken=0
-    [[ "$is_absolute" -eq 0 ]] && is_broken=1 # Relative external link breaks
+    [[ "$raw" != /* ]] && is_broken=1 # Relative external link breaks
     print_link "$link" "$raw" "$resolved" "$RED" "$is_broken"
   fi
 done
