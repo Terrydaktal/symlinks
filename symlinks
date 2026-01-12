@@ -115,7 +115,7 @@ if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
     fi
 
     echo -e "${BOLD}${PURPLE}== 1: Incoming Symlinks (Outside -> ${FOLDER_ABS}) ==${NC}"
-    "${sudo_prefix[@]}" "$FD_BIN" -t l -H "$SCAN_ROOT_ABS" \
+    "${sudo_prefix[@]}" "$FD_BIN" -t l -H . "$SCAN_ROOT_ABS" \
       -E proc -E sys -E dev -E run -E mnt -E tmp -E .git -E .cache -E node_modules \
       -x bash -c '
         folder_abs="$1"; shift
