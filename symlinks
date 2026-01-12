@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  symlinks <folder> [--root <scan_root>] [--no-sudo] [--no-system-scan]
+
+What it does:
+  1) Lists all symlinks *within* <folder> (recursive) showing:
+     LINK_PATH -> RAW_TARGET (resolved: ABSOLUTE_TARGET)
+
+  2) Uses fd to search for symlinks under <scan_root> (default "/") whose
+     resolved target points *into* <folder>.
+
+Options:
+  --root <scan_root>    Where to scan for "incoming" links (default "/")
+  --no-sudo             Do not use sudo for the system scan
+  --no-system-scan      Only list symlinks inside <folder>, skip the fd scan
+EOF
+}
+
+# ---- argument parsing ----
+if [[ $# -lt 1 ]]; then usage; exit 2; fi
+
+FOLDER="${1:-}"; shift || true
+SCAN_ROOT="/"
+USE_SUDO="auto"
+DO_SYSTEM_SCAN=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      SCAN_ROOT="${2:?--root requires a path}"; shift 2
+      ;;
+    --no-sudo)
+      USE_SUDO="no"; shift
+      ;;
+    --no-system-scan)
+      DO_SYSTEM_SCAN=0; shift
+      ;;
+    -h|--help)
+      usage; exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+# ---- tool detection ----
+FD_BIN=""
+if command -v fd >/dev/null 2>&1; then
+  FD_BIN="fd"
+elif command -v fdfind >/dev/null 2>&1; then
+  FD_BIN="fdfind"
+fi
+
+if ! command -v readlink >/dev/null 2>&1; then
+  echo "Error: readlink not found." >&2
+  exit 1
+fi
+
+# GNU coreutils realpath preferred; fallback to python if missing
+resolve_path() {
+  # resolves a path without requiring it to exist
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$1"
+  else
+    python3 - <<'PY' "$1"
+import os, sys
+p = sys.argv[1]
+print(os.path.normpath(os.path.abspath(p)))
+PY
+  fi
+}
+
+# Resolve symlink target relative to the symlink's directory when needed
+resolve_symlink_target() {
+  local link_path="$1"
+  local raw_target="$2"
+
+  if [[ "$raw_target" = /* ]]; then
+    resolve_path "$raw_target"
+  else
+    resolve_path "$(dirname -- "$link_path")/$raw_target"
+  fi
+}
+
+FOLDER_ABS="$(resolve_path "$FOLDER")"
+SCAN_ROOT_ABS="$(resolve_path "$SCAN_ROOT")"
+
+# ---- 1) symlinks within folder ----
+echo "== Symlinks located under: $FOLDER_ABS =="
+# Use find here for reliability; you asked fd specifically for the system-wide search.
+find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
+  raw="$(readlink -- "$link" || true)"
+  resolved="$(resolve_symlink_target "$link" "$raw")"
+  printf '%s -> %s (resolved: %s)\n' "$link" "$raw" "$resolved"
+done
+
+# ---- 2) system scan for incoming links using fd ----
+if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
+  if [[ -z "$FD_BIN" ]]; then
+    echo "Warning: fd/fdfind not found; skipping system scan." >&2
+    exit 0
+  fi
+
+  sudo_prefix=()
+  if [[ "$USE_SUDO" == "auto" ]]; then
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      if command -v sudo >/dev/null 2>&1; then
+        sudo_prefix=(sudo)
+      fi
+    fi
+  elif [[ "$USE_SUDO" == "no" ]]; then
+    sudo_prefix=()
+  fi
+
+  echo
+  echo "== Symlinks anywhere under $SCAN_ROOT_ABS whose target is inside: $FOLDER_ABS =="
+  echo "(Using: ${sudo_prefix[*]:-no-sudo} $FD_BIN -t l -H -u . $SCAN_ROOT_ABS ...)"
+
+  # Exclusions to avoid kernel/procfs noise and permission churn.
+  # Adjust as needed.
+  "${sudo_prefix[@]}" "$FD_BIN" -t l -H -u . "$SCAN_ROOT_ABS" \
+    -E proc -E sys -E dev -E run -E mnt -E tmp \
+    2>/dev/null \
+  | while IFS= read -r link; do
+      raw="$(readlink -- "$link" || true)"
+      resolved="$(resolve_symlink_target "$link" "$raw")"
+
+      case "$resolved" in
+        "$FOLDER_ABS" | "$FOLDER_ABS"/*)
+          printf '%s -> %s (resolved: %s)\n' "$link" "$raw" "$resolved"
+          ;;
+      esac
+    done
+fi
