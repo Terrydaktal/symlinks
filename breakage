@@ -85,7 +85,11 @@ if [[ "$FOLDER_ABS" == "$HOME"* ]]; then
 fi
 
 SRC_GLOBS="*.{c,cpp,h,hpp,js,ts,py,rs,go,java,sh,rb,php,md,html,css,json,yaml,yml,toml}"
-EXCLUDES=("proc" "sys" "dev" "run" "mnt" "tmp" ".git" ".cache" "node_modules" "venv" ".venv" "target")
+EXCLUDES=(
+  "proc" "sys" "dev" "run" "mnt" "tmp" 
+  ".git" ".cache" "node_modules" "venv" ".venv" "target"
+  "gemini" ".gemini" "codex" ".codex"
+)
 
 # Shared search logic
 SUDO_CMD=()
