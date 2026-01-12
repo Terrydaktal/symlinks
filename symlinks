@@ -51,14 +51,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- colors ----
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+RED=$'\e[0;31m'
+GREEN=$'\e[0;32m'
+YELLOW=$'\e[1;33m'
+BLUE=$'\e[0;34m'
+PURPLE=$'\e[0;35m'
+CYAN=$'\e[0;36m'
+BOLD=$'\e[1m'
+NC=$'\e[0m'
 
 # ---- tool detection ----
 FD_BIN=""
@@ -96,10 +96,10 @@ print_link() {
   local raw="$2"
   local resolved="$3"
   local color="$4"
-  local broken_if_moved="${5:-}"
+  local is_broken="${5:-0}"
   
   local marker=""
-  if [[ -n "$broken_if_moved" ]]; then
+  if [[ "$is_broken" -eq 1 ]]; then
     marker=" ${BOLD}${RED}[BROKEN IF MOVED]${NC}"
   fi
   
@@ -122,17 +122,17 @@ if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
     fi
 
     echo -e "${BOLD}${PURPLE}== 1: Incoming Symlinks (Outside -> ${FOLDER_ABS}) ==${NC}"
-    echo -e "${CYAN}(Note: These break if the FOLDER moves because their targets point to the old path)${NC}"
+    echo -e "${CYAN}(These break because they point to this specific folder path)${NC}"
     "${sudo_prefix[@]}" "$FD_BIN" -t l -H . "$SCAN_ROOT_ABS" \
       -E proc -E sys -E dev -E run -E mnt -E tmp -E .git -E .cache -E node_modules \
       -x bash -c '
         folder_abs="$1"; shift
-        BLUE="\033[0;34m"
-        YELLOW="\033[1;33m"
-        CYAN="\033[0;36m"
-        RED="\033[0;31m"
-        BOLD="\033[1m"
-        NC="\033[0m"
+        BLUE=$'\''\e[0;34m'\''
+        YELLOW=$'\''\e[1;33m'\''
+        CYAN=$'\''\e[0;36m'\''
+        RED=$'\''\e[0;31m'\''
+        BOLD=$'\''\e[1m'\''
+        NC=$'\''\e[0m'\''
         for link in "$@"; do
           [[ "$link" == "$folder_abs" || "$link" == "$folder_abs"/* ]] && continue
           
@@ -156,34 +156,37 @@ fi
 
 # ---- 2) Internal: Symlinks within the folder to other locations in the folder ----
 echo -e "${BOLD}${GREEN}== 2: Internal Symlinks (${FOLDER_ABS} -> ${FOLDER_ABS}) ==${NC}"
+echo -e "${CYAN}(Absolute internal links break; relative ones survive)${NC}"
 find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
   raw="$(readlink -- "$link" || true)"
   if [[ "$raw" = /* ]]; then
     resolved="$(resolve_path "$raw")"
-    # Absolute internal links break if the folder is moved
-    print_link "$link" "$raw" "$resolved" "$GREEN" "1"
+    print_link "$link" "$raw" "$resolved" "$GREEN" 1
   else
     resolved="$(resolve_path "$(dirname -- "$link")/$raw")"
-    # Relative internal links survive moves
-    print_link "$link" "$raw" "$resolved" "$GREEN" ""
+    # Relative internal link check
+    if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
+      print_link "$link" "$raw" "$resolved" "$GREEN" 0
+    fi
   fi
 done
 echo
 
 # ---- 3) External: Symlinks from the folder to outside locations ----
 echo -e "${BOLD}${RED}== 3: External Symlinks (${FOLDER_ABS} -> Outside) ==${NC}"
+echo -e "${CYAN}(Relative external links break; absolute ones to system paths survive)${NC}"
 find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
   raw="$(readlink -- "$link" || true)"
   if [[ "$raw" = /* ]]; then
     resolved="$(resolve_path "$raw")"
+    is_broken=0 # Absolute external target survives
   else
     resolved="$(resolve_path "$(dirname -- "$link")/$raw")"
+    is_broken=1 # Relative jump to outside might fail if FOLDER moves
   fi
 
   if [[ "$resolved" != "$FOLDER_ABS" && "$resolved" != "$FOLDER_ABS"/* ]]; then
-    # External links break if the TARGET moves, or if they are absolute and the link moves (less common context but true)
-    # However, for this request: "internal links that are non relative and all external links"
-    print_link "$link" "$raw" "$resolved" "$RED" "1"
+    print_link "$link" "$raw" "$resolved" "$RED" "$is_broken"
   fi
 done
 
