@@ -18,22 +18,25 @@ ${BOLD}breakage${NC} - Search code for paths that will break if a folder is move
 ${BOLD}Usage:${NC}
   breakage <folder> [search_path] [options]
 
-${BOLD}Detailed Instructions:${NC}
-  This tool identifies hardcoded references to a folder that will break on move.
-  It uses "Confirmed Resolution" to verify if relative paths actually point to
-  the target, reducing false positives from common folder names.
+${BOLD}What it does:${NC}
+  Finds references to <folder> that would break if <folder> is moved/renamed:
+    1) Absolute path references (e.g. /home/lewis/Dev/...)
+    2) Confirmed relative references that resolve into <folder> (reduces false positives)
 
 ${BOLD}Options:${NC}
   ${BOLD}-h, --help${NC}
       Show this help message.
   ${BOLD}--no-filter${NC}
-      Search all files instead of just common source code extensions.
+      Search all files instead of just common source/config extensions.
   ${BOLD}--no-truncate${NC}
       Show full line content instead of a truncated snippet.
   ${BOLD}--sudo${NC}
       Run search with sudo (useful for system-wide scans).
 
 ${BOLD}Examples:${NC}
+  breakage /home/lewis/Dev .
+  breakage /home/lewis/Dev ~ --no-filter
+  breakage /home/lewis/Dev /etc --no-filter --sudo
   breakage /home/lewis/Dev / --no-filter --sudo
 EOF
 }
@@ -52,10 +55,16 @@ while [[ $# -gt 0 ]]; do
     --no-truncate) DO_TRUNCATE=0; shift ;;
     --sudo) USE_SUDO=1; shift ;;
     -*) echo -e "${RED}Unknown arg: $1${NC}" >&2; usage; exit 2 ;;
-    *) 
-      if [[ -z "$FOLDER" ]]; then FOLDER="$1"; shift
-      elif [[ -z "$SEARCH_PATH" ]]; then SEARCH_PATH="$1"; shift
-      else echo -e "${RED}Too many arguments.${NC}" >&2; usage; exit 2; fi
+    *)
+      if [[ -z "$FOLDER" ]]; then
+        FOLDER="$1"; shift
+      elif [[ -z "$SEARCH_PATH" ]]; then
+        SEARCH_PATH="$1"; shift
+      else
+        echo -e "${RED}Too many arguments.${NC}" >&2
+        usage
+        exit 2
+      fi
       ;;
   esac
 done
@@ -63,16 +72,13 @@ done
 [[ -z "$FOLDER" ]] && { usage; exit 2; }
 SEARCH_PATH="${SEARCH_PATH:-.}"
 
-# Get script's own path to exclude it
-SCRIPT_SELF="$(realpath "$0")"
-
 # Tool detection
 RG_BIN=""
 command -v rg >/dev/null 2>&1 && RG_BIN="rg"
 
 resolve_path() {
-  if command -v realpath >/dev/null 2>&1;
-  then
+  # Resolve as best-effort, without requiring the path to exist.
+  if command -v realpath >/dev/null 2>&1; then
     realpath -m -- "$1" 2>/dev/null || echo "$1"
   else
     python3 - <<'PY' "$1" 2>/dev/null
@@ -91,10 +97,15 @@ if [[ "$FOLDER_ABS" == "$HOME"* ]]; then
   [[ "$REL_TO_HOME" != "$FOLDER_ABS" ]] && FOLDER_HOME_ALT="~/$REL_TO_HOME"
 fi
 
-SRC_GLOBS="*.{c,cpp,h,hpp,js,ts,py,rs,go,java,sh,rb,php,md,html,css,json,yaml,yml,toml}"
+# Common source/config extensions (rg supports this brace form; grep does not)
+SRC_GLOBS_RG="*.{c,cpp,h,hpp,js,ts,py,rs,go,java,sh,rb,php,md,html,css,json,yaml,yml,toml}"
+SRC_EXTS_GREP=(c cpp h hpp js ts py rs go java sh rb php md html css json yaml yml toml)
+
+# Directories to exclude by default (esp. important for "/" scans)
 EXCLUDES=(
-  "proc" "sys" "dev" "run" "mnt" "tmp" "var/tmp" "var/cache"
+  "proc" "sys" "dev" "run" "mnt" "tmp" "var/tmp" "var/cache" "var/log" "var/lib"
   ".git" ".cache" "node_modules" "venv" ".venv" "target"
+  "snap"
   "gemini" ".gemini" "codex" ".codex"
 )
 
@@ -105,43 +116,50 @@ SUDO_CMD=()
 RG_EXCLUDE_FLAGS=()
 GREP_EXCLUDE_FLAGS=()
 for x in "${EXCLUDES[@]}"; do
-  RG_EXCLUDE_FLAGS+=("-g" "!$x/*" "-g" "!**/$x/*")
+  # Exclude top-level and nested occurrences, recursively.
+  RG_EXCLUDE_FLAGS+=("--glob" "!${x}/**" "--glob" "!**/${x}/**")
   GREP_EXCLUDE_FLAGS+=("--exclude-dir=$x")
 done
 
-# Exclude self
-RG_EXCLUDE_FLAGS+=("--glob" "!$SCRIPT_SELF")
-
 echo -e "${BOLD}${PURPLE}== Analyzing potential breakage for moving: ${FOLDER_ABS} ==${NC}"
 [[ -n "$FOLDER_HOME_ALT" ]] && echo -e "${CYAN}(Also checking for: ${FOLDER_HOME_ALT})${NC}"
-echo -e "${CYAN}(Searching in: ${SEARCH_PATH} | Filter: $( [[ $USE_FILTER -eq 1 ]] && echo "Enabled" || echo "Disabled" ))${NC}"
+echo -e "${CYAN}(Searching in: ${SEARCH_PATH} | Filter: $( [[ $USE_FILTER -eq 1 ]] && echo "Enabled" || echo "Disabled" ) | Sudo: $( [[ $USE_SUDO -eq 1 ]] && echo "Yes" || echo "No" ))${NC}"
 echo
 
 # Create a temporary python helper script
-PY_HELPER=$(mktemp)
+PY_HELPER="$(mktemp)"
 cat <<'EOF' > "$PY_HELPER"
 import sys, re
 
-mode = sys.argv[1] # 'extract' or 'truncate'
-name_or_patt = sys.argv[2]
-line = sys.stdin.read().strip()
+mode = sys.argv[1]  # 'extract' or 'truncate'
+needle = sys.argv[2]
+line = sys.stdin.read().rstrip("\n")
 
 if mode == 'extract':
     results = set()
+
+    # Extract quoted strings first (single or double quotes)
     for m in re.finditer(r"(['\x22])(.*?)\1", line):
-        if name_or_patt in m.group(2): results.add(m.group(2))
+        s = m.group(2)
+        if needle in s:
+            results.add(s)
+
+    # Then extract rough "tokens" (paths often appear as tokens)
     for word in re.split(r"[ \x22'():\[\]{}<>|,;]", line):
-        if name_or_patt in word: results.add(word)
-    for r in sorted(list(results)):
-        if r: sys.stdout.write(r + '\n')
+        if needle in word:
+            results.add(word)
+
+    for r in sorted(results):
+        if r:
+            sys.stdout.write(r + "\n")
 
 elif mode == 'truncate':
-    idx = line.find(name_or_patt)
+    idx = line.find(needle)
     if idx == -1:
-        sys.stdout.write(line[:100] + "...\n")
+        sys.stdout.write((line[:100] + "...\n") if len(line) > 100 else (line + "\n"))
     else:
-        start = max(0, idx - 40)
-        end = min(len(line), idx + len(name_or_patt) + 40)
+        start = max(0, idx - 60)
+        end = min(len(line), idx + len(needle) + 60)
         prefix = "..." if start > 0 else ""
         suffix = "..." if end < len(line) else ""
         sys.stdout.write(f"{prefix}{line[start:end]}{suffix}\n")
@@ -152,41 +170,72 @@ display_line() {
   local content="$1"
   local patt="$2"
   if [[ "$DO_TRUNCATE" -eq 1 ]]; then
-    echo "$content" | python3 "$PY_HELPER" truncate "$patt"
+    printf "%s" "$content" | python3 "$PY_HELPER" truncate "$patt"
   else
-    echo "$content"
+    printf "%s\n" "$content"
   fi
 }
 
-# 1. Absolute Path Matches
+# =========================
+# 1) Absolute Path Matches
+# =========================
 echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
 HAS_ABS=0
+declare -A SEEN_ABS=()
 
 if [[ -n "$RG_BIN" ]]; then
-  RG_ABS_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=never" "--no-messages" "--fixed-strings" "--vimgrep")
-  [[ "$USE_FILTER" -eq 1 ]] && RG_ABS_ARGS+=("-g" "$SRC_GLOBS")
-  
+  # IMPORTANT: put include globs first, exclude globs last (rg is last-match-wins)
+  RG_ABS_ARGS=("--color=never" "--no-messages" "--fixed-strings" "--vimgrep")
+  [[ "$USE_FILTER" -eq 1 ]] && RG_ABS_ARGS+=("-g" "$SRC_GLOBS_RG")
+  RG_ABS_ARGS+=("${RG_EXCLUDE_FLAGS[@]}")
+
   while IFS=: read -r file line_num _ line_content; do
-    [[ "$(realpath "$file" 2>/dev/null || echo "$file")" == "$SCRIPT_SELF" ]] && continue
+    [[ -z "${file:-}" ]] && continue
+
+    # Deduplicate by file:line (avoids duplicates when multiple -e patterns hit same line)
+    key="$file:$line_num"
+    [[ -n "${SEEN_ABS[$key]:-}" ]] && continue
+    SEEN_ABS[$key]=1
+
+    # Skip if this script itself appears in results (when searching widely)
+    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
+      continue
+    fi
+
     HAS_ABS=1
     patt="$FOLDER_ABS"
-    [[ "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
-    snippet=$(display_line "$line_content" "$patt")
+    [[ -n "$FOLDER_HOME_ALT" && "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
+    snippet="$(display_line "$line_content" "$patt")"
     echo -e "${GREEN}$file:$line_num${NC}: $snippet"
   done < <("${SUDO_CMD[@]}" "$RG_BIN" "${RG_ABS_ARGS[@]}" -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" 2>/dev/null || true)
 else
+  # Grep fallback: implement filtering via multiple --include patterns (grep doesn't understand brace globs)
   GREP_ABS_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=never" "-F")
-  [[ "$USE_FILTER" -eq 1 ]] && GREP_ABS_ARGS+=("--include=$SRC_GLOBS")
-  
+  if [[ "$USE_FILTER" -eq 1 ]]; then
+    for ext in "${SRC_EXTS_GREP[@]}"; do
+      GREP_ABS_ARGS+=("--include=*.${ext}")
+    done
+  fi
+
   while IFS=: read -r file line_num line_content; do
-    [[ "$(realpath "$file" 2>/dev/null || echo "$file")" == "$SCRIPT_SELF" ]] && continue
+    [[ -z "${file:-}" ]] && continue
+
+    key="$file:$line_num"
+    [[ -n "${SEEN_ABS[$key]:-}" ]] && continue
+    SEEN_ABS[$key]=1
+
+    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
+      continue
+    fi
+
     HAS_ABS=1
     patt="$FOLDER_ABS"
-    [[ "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
-    snippet=$(display_line "$line_content" "$patt")
+    [[ -n "$FOLDER_HOME_ALT" && "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
+    snippet="$(display_line "$line_content" "$patt")"
     echo -e "${GREEN}$file:$line_num${NC}: $snippet"
   done < <("${SUDO_CMD[@]}" grep "${GREP_ABS_ARGS[@]}" -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" 2>/dev/null || true)
 fi
+
 [[ $HAS_ABS -eq 0 ]] && echo -e "${YELLOW}No absolute path matches found.${NC}"
 
 echo
@@ -195,52 +244,82 @@ echo -e "${CYAN}(Verifying if paths actually resolve to the target directory)${N
 
 process_hit() {
   local file="$1" line_num="$2" line_content="$3"
-  local file_dir="$(dirname "$file")"
-  [[ "$file_dir" != /* ]] && file_dir="$PWD/$file_dir"
+
+  local file_dir
+  file_dir="$(dirname -- "$file")"
+  file_dir="$(resolve_path "$file_dir")"
 
   local potentials
-  potentials=$(echo "$line_content" | python3 "$PY_HELPER" extract "$FOLDER_NAME" 2>/dev/null || true)
+  potentials="$(printf "%s" "$line_content" | python3 "$PY_HELPER" extract "$FOLDER_NAME" 2>/dev/null || true)"
 
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
+
+    if [[ "$p" == "$FOLDER_NAME" ]]; then
+      local has_slash=0 is_quoted=0
+      [[ "$line_content" == *"/"* ]] && has_slash=1
+      [[ "$line_content" == *"'$FOLDER_NAME'"* || "$line_content" == *"\"$FOLDER_NAME\""* ]] && is_quoted=1
+      [[ $has_slash -eq 0 && $is_quoted -eq 0 ]] && continue
+    fi
+
     local resolved=""
-    if [[ "$p" == "~/"* ]]; then resolved="$(resolve_path "${p/#	/$HOME}")"
-    elif [[ "$p" == /* ]]; then resolved="$(resolve_path "$p")"
+    if [[ "$p" == "~/"* ]]; then
+      resolved="$(resolve_path "${p/#\~/$HOME}")"
+    elif [[ "$p" == /* ]]; then
+      resolved="$(resolve_path "$p")"
     else
-      if [[ "$p" == "$FOLDER_NAME" ]]; then
-         local has_slash=0; [[ "$line_content" == *"/"* ]] && has_slash=1
-         local is_quoted=0; [[ "$line_content" == *"'$FOLDER_NAME'"* || "$line_content" == *"\"$FOLDER_NAME\""* ]] && is_quoted=1
-         [[ $has_slash -eq 0 && $is_quoted -eq 0 ]] && continue
-      fi
       resolved="$(resolve_path "$file_dir/$p")"
     fi
+
     if [[ -n "$resolved" ]] && [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-      snippet=$(display_line "$line_content" "$p")
+      local snippet
+      snippet="$(display_line "$line_content" "$p")"
       echo -e "${GREEN}$file:$line_num${NC}: $snippet ${BOLD}${GREEN}[CONFIRMED]${NC} (via: $p)"
       break
     fi
   done <<< "$potentials"
 }
 
-MAX_HITS=5000; hit_count=0
+MAX_HITS=5000
+hit_count=0
+
 if [[ -n "$RG_BIN" ]]; then
-  RG_REL_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=never" "--no-messages" "-w" "$FOLDER_NAME" "--vimgrep" "--glob" "!**/${FOLDER_NAME}/**")
-  [[ "$USE_FILTER" -eq 1 ]] && RG_REL_ARGS+=("-g" "$SRC_GLOBS")
-  
+  # IMPORTANT: include first, exclude last (last-match-wins)
+  RG_REL_ARGS=("--color=never" "--no-messages" "-w" "$FOLDER_NAME" "--vimgrep" "--glob" "!**/${FOLDER_NAME}/**")
+  [[ "$USE_FILTER" -eq 1 ]] && RG_REL_ARGS+=("-g" "$SRC_GLOBS_RG")
+  RG_REL_ARGS+=("${RG_EXCLUDE_FLAGS[@]}")
+
   while IFS=: read -r file line_num _ line_content; do
-    [[ "$(realpath "$file" 2>/dev/null || echo "$file")" == "$SCRIPT_SELF" ]] && continue
+    [[ -z "${file:-}" ]] && continue
+
+    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
+      continue
+    fi
+
     process_hit "$file" "$line_num" "$line_content"
-    ((hit_count++)); [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
+    ((hit_count += 1))
+    [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
   done < <("${SUDO_CMD[@]}" "$RG_BIN" "${RG_REL_ARGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
 else
   GREP_REL_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=never" "-w" "$FOLDER_NAME" "--exclude-dir=$FOLDER_NAME")
-  [[ "$USE_FILTER" -eq 1 ]] && GREP_REL_ARGS+=("--include=$SRC_GLOBS")
+  if [[ "$USE_FILTER" -eq 1 ]]; then
+    for ext in "${SRC_EXTS_GREP[@]}"; do
+      GREP_REL_ARGS+=("--include=*.${ext}")
+    done
+  fi
 
   while IFS=: read -r file line_num line_content; do
-    [[ "$(realpath "$file" 2>/dev/null || echo "$file")" == "$SCRIPT_SELF" ]] && continue
+    [[ -z "${file:-}" ]] && continue
+
+    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
+      continue
+    fi
+
     process_hit "$file" "$line_num" "$line_content"
-    ((hit_count++)); [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
+    ((hit_count += 1))
+    [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
   done < <("${SUDO_CMD[@]}" grep "${GREP_REL_ARGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
 fi
 
-echo; echo -e "${BOLD}${GREEN}Done.${NC}"
+echo
+echo -e "${BOLD}${GREEN}Done.${NC}"
