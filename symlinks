@@ -90,6 +90,7 @@ resolve_symlink_target() {
 }
 
 FOLDER_ABS="$(resolve_path "$FOLDER")"
+export FOLDER_ABS
 SCAN_ROOT_ABS="$(resolve_path "$SCAN_ROOT")"
 
 # ---- 1) symlinks within folder ----
@@ -121,21 +122,23 @@ if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
 
   echo
   echo "== Symlinks anywhere under $SCAN_ROOT_ABS whose target is inside: $FOLDER_ABS =="
-  echo "(Using: ${sudo_prefix[*]:-no-sudo} $FD_BIN -t l -H -u . $SCAN_ROOT_ABS ...)"
+  echo "(Using: ${sudo_prefix[*]:-no-sudo} $FD_BIN -t l -H $SCAN_ROOT_ABS ...)"
 
   # Exclusions to avoid kernel/procfs noise and permission churn.
-  # Adjust as needed.
-  "${sudo_prefix[@]}" "$FD_BIN" -t l -H -u . "$SCAN_ROOT_ABS" \
-    -E proc -E sys -E dev -E run -E mnt -E tmp \
-    2>/dev/null \
-  | while IFS= read -r link; do
-      raw="$(readlink -- "$link" || true)"
-      resolved="$(resolve_symlink_target "$link" "$raw")"
-
-      case "$resolved" in
-        "$FOLDER_ABS" | "$FOLDER_ABS"/*)
-          printf '%s -> %s (resolved: %s)\n' "$link" "$raw" "$resolved"
-          ;;
-      esac
-    done
+  "${sudo_prefix[@]}" "$FD_BIN" -t l -H "$SCAN_ROOT_ABS" \
+    -E proc -E sys -E dev -E run -E mnt -E tmp -E .git -E .cache -E node_modules \
+    -x bash -c '
+      for link in "$@"; do
+        raw=$(readlink "$link")
+        # Resolve relative links
+        if [[ "$raw" != /* ]]; then
+          resolved=$(realpath -m "$(dirname "$link")/$raw")
+        else
+          resolved=$(realpath -m "$raw")
+        fi
+        if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
+          printf "%s -> %s (resolved: %s)\n" "$link" "$raw" "$resolved"
+        fi
+      done
+    ' bash {} + 2>/dev/null
 fi
