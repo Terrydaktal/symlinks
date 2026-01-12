@@ -16,56 +16,61 @@ usage() {
 ${BOLD}breakage${NC} - Search code for paths that will break if a folder is moved
 
 ${BOLD}Usage:${NC}
-  breakage <folder> [search_path]
+  breakage <folder> [search_path] [options]
 
 ${BOLD}Detailed Instructions:${NC}
   This tool identifies hardcoded references to a folder that will break on move.
   It uses "Confirmed Resolution" to verify if relative paths actually point to
-  the target, reducing false positives from common folder names (like 'bin', 'Dev').
-
-  It searches for:
-  1) ${BOLD}Absolute Paths:${NC} Exact matches for the full path or ~/ equivalent.
-  2) ${BOLD}Confirmed Relative Paths:${NC} Paths like '../folder' that actually
-     resolve to the target directory from the file's location.
+  the target, reducing false positives from common folder names.
 
 ${BOLD}Options:${NC}
   ${BOLD}-h, --help${NC}
       Show this help message.
+  ${BOLD}--no-filter${NC}
+      Search all files instead of just common source code extensions.
+  ${BOLD}--sudo${NC}
+      Run search with sudo (useful for system-wide scans).
 
 ${BOLD}Examples:${NC}
-  breakage ./my-data-dir
-  breakage /home/lewis/Dev src/
+  breakage /home/lewis/Dev / --no-filter --sudo
 EOF
 }
 
-if [[ $# -lt 1 ]]; then
-  usage
-  exit 2
-fi
+# ---- argument parsing ----
+FOLDER=""
+SEARCH_PATH=""
+USE_FILTER=1
+USE_SUDO=0
 
-if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-  usage
-  exit 0
-fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --no-filter) USE_FILTER=0; shift ;;
+    --sudo) USE_SUDO=1; shift ;;
+    -*) echo -e "${RED}Unknown arg: $1${NC}" >&2; usage; exit 2 ;;
+    *) 
+      if [[ -z "$FOLDER" ]]; then FOLDER="$1"; shift
+      elif [[ -z "$SEARCH_PATH" ]]; then SEARCH_PATH="$1"; shift
+      else echo -e "${RED}Too many arguments.${NC}" >&2; usage; exit 2; fi
+      ;;
+  esac
+done
 
-FOLDER="$1"
-SEARCH_PATH="${2:-.}"
+[[ -z "$FOLDER" ]] && { usage; exit 2; }
+SEARCH_PATH="${SEARCH_PATH:-.}"
 
 # Tool detection
 RG_BIN=""
-if command -v rg >/dev/null 2>&1; then
-  RG_BIN="rg"
-fi
+command -v rg >/dev/null 2>&1 && RG_BIN="rg"
 
 resolve_path() {
   if command -v realpath >/dev/null 2>&1;
-    then
+  then
     realpath -m -- "$1" 2>/dev/null || echo "$1"
   else
     python3 - <<'PY' "$1" 2>/dev/null
 import os, sys
-p = sys.argv[1]
-print(os.path.normpath(os.path.abspath(p)))
+print(os.path.normpath(os.path.abspath(sys.argv[1])))
 PY
   fi
 }
@@ -73,113 +78,120 @@ PY
 FOLDER_ABS="$(resolve_path "$FOLDER")"
 FOLDER_NAME="$(basename "$FOLDER_ABS")"
 
-# Prepare ~/ version if applicable
 FOLDER_HOME_ALT=""
 if [[ "$FOLDER_ABS" == "$HOME"* ]]; then
   REL_TO_HOME="${FOLDER_ABS#$HOME/}"
-  if [[ "$REL_TO_HOME" != "$FOLDER_ABS" ]]; then
-    FOLDER_HOME_ALT="~/$REL_TO_HOME"
-  fi
+  [[ "$REL_TO_HOME" != "$FOLDER_ABS" ]] && FOLDER_HOME_ALT="~/$REL_TO_HOME"
 fi
 
-# Common source extensions
 SRC_GLOBS="*.{c,cpp,h,hpp,js,ts,py,rs,go,java,sh,rb,php,md,html,css,json,yaml,yml,toml}"
-
-# Exclusions
 EXCLUDES=("proc" "sys" "dev" "run" "mnt" "tmp" ".git" ".cache" "node_modules" "venv" ".venv" "target")
-RG_EXCLUDES=()
-GREP_EXCLUDES=()
-for x in "${EXCLUDES[@]}"; do
-  RG_EXCLUDES+=(--glob "!**/$x/**")
-  GREP_EXCLUDES+=(--exclude-dir="$x")
-done
+
+# Shared search logic
+SUDO_CMD=()
+[[ "$USE_SUDO" -eq 1 ]] && SUDO_CMD=(sudo)
 
 echo -e "${BOLD}${PURPLE}== Analyzing potential breakage for moving: ${FOLDER_ABS} ==${NC}"
 [[ -n "$FOLDER_HOME_ALT" ]] && echo -e "${CYAN}(Also checking for: ${FOLDER_HOME_ALT})${NC}"
-echo -e "${CYAN}(Searching in: ${SEARCH_PATH})${NC}"
+echo -e "${CYAN}(Searching in: ${SEARCH_PATH} | Filter: $( [[ $USE_FILTER -eq 1 ]] && echo "Enabled" || echo "Disabled" ))${NC}"
 echo
 
 # 1. Absolute Path Matches
 echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
 HAS_ABS=0
+
+# Build exclusion flags for rg/grep
+RG_EXCLUDE_FLAGS=()
+GREP_EXCLUDE_FLAGS=()
+for x in "${EXCLUDES[@]}"; do
+  RG_EXCLUDE_FLAGS+=("--glob" "!**/$x/**")
+  GREP_EXCLUDE_FLAGS+=("--exclude-dir=$x")
+done
+
 if [[ -n "$RG_BIN" ]]; then
-  $RG_BIN --fixed-strings --color=always --line-number -g "$SRC_GLOBS" "${RG_EXCLUDES[@]}" \
+  RG_ABS_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=always" "--line-number" "--no-messages" "--fixed-strings")
+  [[ "$USE_FILTER" -eq 1 ]] && RG_ABS_ARGS+=("-g" "$SRC_GLOBS")
+  
+  "${SUDO_CMD[@]}" "$RG_BIN" "${RG_ABS_ARGS[@]}" \
     -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" && HAS_ABS=1 || true
 else
-  grep -rnF --color=always --include="$SRC_GLOBS" "${GREP_EXCLUDES[@]}" \
+  GREP_ABS_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=always" "-F")
+  [[ "$USE_FILTER" -eq 1 ]] && GREP_ABS_ARGS+=("--include=$SRC_GLOBS")
+  
+  "${SUDO_CMD[@]}" grep "${GREP_ABS_ARGS[@]}" \
     -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" && HAS_ABS=1 || true
 fi
 [[ $HAS_ABS -eq 0 ]] && echo -e "${YELLOW}No absolute path matches found.${NC}"
 
 echo
-
-# 2. Confirmed Relative/Named References
 echo -e "${BOLD}${BLUE}2) Confirmed relative references to '${FOLDER_NAME}'${NC}"
 echo -e "${CYAN}(Verifying if paths actually resolve to the target directory)${NC}"
 
-# We use a loop to verify each potential hit
-declare -a CONFIRMED_HITS=()
+PY_EXTRACTOR=$(mktemp)
+cat <<'EOF' > "$PY_EXTRACTOR"
+import sys, re
+name = sys.argv[1]
+line = sys.stdin.read()
+results = set()
+# Match anything in quotes (handle both hex-safe)
+for m in re.finditer(r"(['\x22])(.*?)\1", line):
+    if name in m.group(2): results.add(m.group(2))
+# Match words
+for word in re.split(r"[ \x22'():\[\]{}<>|,;]", line):
+    if name in word: results.add(word)
+for r in sorted(list(results)):
+    if r: sys.stdout.write(r + '\n')
+EOF
+trap 'rm -f "$PY_EXTRACTOR"' EXIT
 
 process_hit() {
-  local file="$1"
-  local line_num="$2"
-  local line_content="$3"
-  local file_dir
-  file_dir="$(dirname "$file")"
+  local file="$1" line_num="$2" line_content="$3"
+  local file_dir="$(dirname "$file")"
+  [[ "$file_dir" != /* ]] && file_dir="$PWD/$file_dir"
 
-  # Use python to safely extract all path-like strings containing FOLDER_NAME
-  local potentials
-  potentials=$(python3 - <<'PY' "$line_content" "$FOLDER_NAME"
-import sys, re
-line = sys.argv[1]
-name = sys.argv[2]
-# Extract anything that might be a path component
-for word in re.split(r"[^a-zA-Z0-9\/._\-~]", line):
-    if name in word:
-        print(word)
-PY
-)
+  # potentials from clean content
+  local potentials=""
+  potentials=$(echo "$line_content" | python3 "$PY_EXTRACTOR" "$FOLDER_NAME" 2>/dev/null || true)
 
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
-    
     local resolved=""
-    if [[ "$p" == "~/"* ]]; then
-      resolved="$(resolve_path "${p/#\~/$HOME}")"
-    elif [[ "$p" == /* ]]; then
-      resolved="$(resolve_path "$p")"
+    if [[ "$p" == "~/"* ]]; then resolved="$(resolve_path "${p/#\~/$HOME}")"
+    elif [[ "$p" == /* ]]; then resolved="$(resolve_path "$p")"
     else
-      # For relative paths, if it is JUST the folder name (e.g. "Dev"), only confirm if it has path context
       if [[ "$p" == "$FOLDER_NAME" ]]; then
-         if [[ "$line_content" != *"/"* ]] && [[ "$line_content" != *"'$FOLDER_NAME'"* ]] && [[ "$line_content" != *"\"$FOLDER_NAME\""* ]]; then
-            continue
-         fi
+         local has_slash=0; [[ "$line_content" == *"/"* ]] && has_slash=1
+         local is_quoted=0; [[ "$line_content" == *"'$FOLDER_NAME'"* || "$line_content" == *"\"$FOLDER_NAME\""* ]] && is_quoted=1
+         [[ $has_slash -eq 0 && $is_quoted -eq 0 ]] && continue
       fi
       resolved="$(resolve_path "$file_dir/$p")"
     fi
-
     if [[ -n "$resolved" ]] && [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-      CONFIRMED_HITS+=("${GREEN}$file:$line_num${NC}: $line_content ${BOLD}${GREEN}[CONFIRMED]${NC} (via: $p)")
+      # Print with color for user, but process_hit got clean inputs
+      echo -e "${GREEN}$file:$line_num${NC}: $line_content ${BOLD}${GREEN}[CONFIRMED]${NC} (via: $p)"
       break
     fi
   done <<< "$potentials"
 }
 
+MAX_HITS=5000; hit_count=0
+# IMPORTANT: For section 2 we use --color=never to ensure we parse clean text
 if [[ -n "$RG_BIN" ]]; then
+  RG_REL_ARGS=("${RG_EXCLUDE_FLAGS[@]}" "--color=never" "--no-messages" "-w" "$FOLDER_NAME" "--vimgrep" "--glob" "!**/${FOLDER_NAME}/**")
+  [[ "$USE_FILTER" -eq 1 ]] && RG_REL_ARGS+=("-g" "$SRC_GLOBS")
+  
+  while IFS=: read -r file line_num _ line_content; do
+    process_hit "$file" "$line_num" "$line_content"
+    ((hit_count++)); [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
+  done < <("${SUDO_CMD[@]}" "$RG_BIN" "${RG_REL_ARGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
+else
+  GREP_REL_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=never" "-w" "$FOLDER_NAME" "--exclude-dir=$FOLDER_NAME")
+  [[ "$USE_FILTER" -eq 1 ]] && GREP_REL_ARGS+=("--include=$SRC_GLOBS")
+
   while IFS=: read -r file line_num line_content; do
     process_hit "$file" "$line_num" "$line_content"
-  done < <($RG_BIN -w "$FOLDER_NAME" --vimgrep -g "$SRC_GLOBS" "${RG_EXCLUDES[@]}" --glob "!**/${FOLDER_NAME}/**" "$SEARCH_PATH" 2>/dev/null || true)
-else
-  while IFS=: read -r file line_num line_content; do
-    process_hit "$file" "$line_num" "$line_content"
-  done < <(grep -rnw "$FOLDER_NAME" --include="$SRC_GLOBS" "${GREP_EXCLUDES[@]}" --exclude-dir="$FOLDER_NAME" "$SEARCH_PATH" 2>/dev/null || true)
+    ((hit_count++)); [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
+  done < <("${SUDO_CMD[@]}" grep "${GREP_REL_FLAGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
 fi
 
-if [[ ${#CONFIRMED_HITS[@]} -gt 0 ]]; then
-  printf "%b\n" "${CONFIRMED_HITS[@]}"
-else
-  echo -e "${YELLOW}No confirmed relative matches found.${NC}"
-fi
-
-echo
-echo -e "${BOLD}${GREEN}Done.${NC}"
+echo; echo -e "${BOLD}${GREEN}Done.${NC}"
