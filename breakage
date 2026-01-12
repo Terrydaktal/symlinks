@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- colors ----
+RED=$'\e[0;31m'
+GREEN=$'\e[0;32m'
+YELLOW=$'\e[1;33m'
+BLUE=$'\e[0;34m'
+PURPLE=$'\e[0;35m'
+CYAN=$'\e[0;36m'
+BOLD=$'\e[1m'
+NC=$'\e[0m'
+
+usage() {
+  cat <<EOF
+${BOLD}breakage${NC} - Search code for paths that will break if a folder is moved
+
+${BOLD}Usage:${NC}
+  breakage <folder> [search_path]
+
+${BOLD}Detailed Instructions:${NC}
+  This tool helps identify hardcoded strings in your code that refer to a specific
+  folder. If you move or rename that folder, these references will break.
+
+  It searches for:
+  1) ${BOLD}Absolute Paths:${NC}
+     Strings that contain the full absolute path of <folder>.
+  2) ${BOLD}Relative/Named References:${NC}
+     Strings that use the folder's name (basename) in a path-like context
+     (e.g., "../foldername/file", "foldername/config").
+
+${BOLD}Options:${NC}
+  ${BOLD}-h, --help${NC}
+      Show this help message.
+
+${BOLD}Examples:${NC}
+  breakage ./my-data-dir
+  breakage /absolute/path/to/dir src/
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+FOLDER="$1"
+SEARCH_PATH="${2:-.}"
+
+# Tool detection
+RG_BIN=""
+if command -v rg >/dev/null 2>&1; then
+  RG_BIN="rg"
+fi
+
+resolve_path() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$1"
+  else
+    python3 - <<'PY' "$1"
+import os, sys
+p = sys.argv[1]
+print(os.path.normpath(os.path.abspath(p)))
+PY
+  fi
+}
+
+FOLDER_ABS="$(resolve_path "$FOLDER")"
+FOLDER_NAME="$(basename "$FOLDER_ABS")"
+
+echo -e "${BOLD}${PURPLE}== Analyzing potential breakage for moving: ${FOLDER_ABS} ==${NC}"
+echo -e "${CYAN}(Searching in: ${SEARCH_PATH})${NC}"
+echo
+
+# 1. Absolute Path Matches
+echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
+if [[ -n "$RG_BIN" ]]; then
+  # Use ripgrep for speed and nice output
+  $RG_BIN --fixed-strings --color=always --line-number "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
+else
+  # Fallback to grep
+  grep -rnF --color=always "$FOLDER_ABS" "$SEARCH_PATH" || echo -e "${YELLOW}No absolute path matches found.${NC}"
+fi
+
+echo
+
+# 2. Relative/Named References
+echo -e "${BOLD}${BLUE}2) Relative or named references to '${FOLDER_NAME}'${NC}"
+echo -e "${CYAN}(Looking for occurrences of the folder name in path-like strings)${NC}"
+
+# We want to find the folder name when it's part of a path.
+# Pattern: \bFOLDER_NAME\b surrounded by / or quotes, or at start of string.
+# This regex tries to find FOLDER_NAME as a path component.
+if [[ -n "$RG_BIN" ]]; then
+  # Regex: (path separator or quote)FOLDER_NAME(path separator or quote or end of string)
+  # Or start of line FOLDER_NAME
+  $RG_BIN --color=always --line-number "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
+    --glob "!**/${FOLDER_NAME}/**" || echo -e "${YELLOW}No relative/named matches found.${NC}"
+else
+  grep -rnE --color=always "(/|\b)${FOLDER_NAME}(/|\b)" "$SEARCH_PATH" \
+    --exclude-dir="$FOLDER_NAME" || echo -e "${YELLOW}No relative/named matches found.${NC}"
+fi
+
+echo
+echo -e "${BOLD}${GREEN}Done.${NC}"

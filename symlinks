@@ -1,55 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-Usage:
-  symlinks <folder> [--root <scan_root>] [--no-sudo] [--no-system-scan]
-
-What it does:
-  1) Lists all symlinks *within* <folder> (recursive) showing:
-     LINK_PATH -> RAW_TARGET (resolved: ABSOLUTE_TARGET)
-
-  2) Uses fd to search for symlinks under <scan_root> (default "/") whose
-     resolved target points *into* <folder>.
-
-Options:
-  --root <scan_root>    Where to scan for "incoming" links (default "/")
-  --no-sudo             Do not use sudo for the system scan
-  --no-system-scan      Only list symlinks inside <folder>, skip the fd scan
-EOF
-}
-
-# ---- argument parsing ----
-if [[ $# -lt 1 ]]; then usage; exit 2; fi
-
-FOLDER="${1:-}"; shift || true
-SCAN_ROOT="/"
-USE_SUDO="auto"
-DO_SYSTEM_SCAN=1
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --root)
-      SCAN_ROOT="${2:?--root requires a path}"; shift 2
-      ;;
-    --no-sudo)
-      USE_SUDO="no"; shift
-      ;;
-    --no-system-scan)
-      DO_SYSTEM_SCAN=0; shift
-      ;;
-    -h|--help)
-      usage; exit 0
-      ;;
-    *)
-      echo "Unknown arg: $1" >&2
-      usage
-      exit 2
-      ;;
-  esac
-done
-
 # ---- colors ----
 RED=$'\e[0;31m'
 GREEN=$'\e[0;32m'
@@ -59,6 +10,94 @@ PURPLE=$'\e[0;35m'
 CYAN=$'\e[0;36m'
 BOLD=$'\e[1m'
 NC=$'\e[0m'
+
+usage() {
+  cat <<EOF
+${BOLD}symlinks${NC} - Audit and analyze symlinks for a directory
+
+${BOLD}Usage:${NC}
+  symlinks <folder> [options]
+
+${BOLD}Detailed Instructions:${NC}
+  This tool helps you understand the symlink relationships of a specific folder.
+  It categorizes links into three groups:
+
+  ${BOLD}1) Incoming Symlinks (System -> Folder)${NC}
+     Finds links elsewhere on the system that point to targets inside <folder>.
+     Moving <folder> will break these links.
+
+  ${BOLD}2) Internal Symlinks (Folder -> Folder)${NC}
+     Links inside <folder> that point to targets also inside <folder>.
+     - ${GREEN}Relative${NC} internal links stay valid if <folder> is moved.
+     - ${RED}Absolute${NC} internal links break if <folder> is moved.
+
+  ${BOLD}3) External Symlinks (Folder -> Outside)${NC}
+     Links inside <folder> that point to targets outside <folder>.
+     - ${GREEN}Absolute${NC} external links stay valid if <folder> is moved.
+     - ${RED}Relative${NC} external links might break if they depend on the
+       folder's position relative to the target.
+
+${BOLD}Markers:${NC}
+  ${BOLD}${RED}[BROKEN NOW]${NC}
+      The symlink is dangling (target does not exist).
+  ${BOLD}${RED}[BROKEN IF MOVED]${NC}
+      The symlink will break if <folder> is moved to a different location.
+
+${BOLD}Options:${NC}
+  ${BOLD}-h, --help${NC}
+      Show this detailed help message.
+  ${BOLD}--root <scan_root>${NC}
+      Where to start scanning for "incoming" links (default: "/").
+  ${BOLD}--no-sudo${NC}
+      Do not use sudo for the system-wide scan.
+  ${BOLD}--no-system-scan${NC}
+      Skip scanning the system for incoming links. Only check links inside <folder>.
+
+${BOLD}Examples:${NC}
+  symlinks .
+  symlinks /home/user/projects/my-project --root /var/www
+EOF
+}
+
+# ---- argument parsing ----
+FOLDER=""
+SCAN_ROOT="/"
+USE_SUDO="auto"
+DO_SYSTEM_SCAN=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage; exit 0
+      ;;
+    --root)
+      SCAN_ROOT="${2:?--root requires a path}"; shift 2
+      ;;
+    --no-sudo)
+      USE_SUDO="no"; shift
+      ;;
+    --no-system-scan)
+      DO_SYSTEM_SCAN=0; shift
+      ;;
+    -*)
+      echo -e "${RED}Unknown arg: $1${NC}" >&2
+      usage; exit 2
+      ;;
+    *)
+      if [[ -z "$FOLDER" ]]; then
+        FOLDER="$1"; shift
+      else
+        echo -e "${RED}Multiple folders specified: $FOLDER and $1${NC}" >&2
+        usage; exit 2
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$FOLDER" ]]; then
+  usage
+  exit 2
+fi
 
 # ---- tool detection ----
 FD_BIN=""
@@ -73,7 +112,8 @@ if ! command -v readlink >/dev/null 2>&1; then
   exit 1
 fi
 
-# GNU coreutils realpath preferred; fallback to python if missing
+# Fully resolve a path (follows symlink chain if it's a symlink),
+# but tolerate missing components (-m). If realpath missing, use python.
 resolve_path() {
   if command -v realpath >/dev/null 2>&1; then
     realpath -m -- "$1"
@@ -86,124 +126,190 @@ PY
   fi
 }
 
-# Normalize path without following symlinks
-normalize_path_no_follow() {
-  python3 - <<'PY' "$1"
+# Normalize a path string WITHOUT dereferencing symlinks.
+# This is lexical join+normalize only.
+normalize_noderef() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m --no-symlinks -- "$1"
+  elif readlink -m / >/dev/null 2>&1; then
+    readlink -m -- "$1"
+  else
+    python3 - <<'PY' "$1"
 import os, sys
-print(os.path.normpath(sys.argv[1]))
+p = sys.argv[1]
+print(os.path.normpath(os.path.abspath(p)))
 PY
+  fi
 }
 
 FOLDER_ABS="$(resolve_path "$FOLDER")"
-export FOLDER_ABS
 SCAN_ROOT_ABS="$(resolve_path "$SCAN_ROOT")"
 
-# ---- helper: print symlink ----
-print_link() {
-  local link="$1"
-  local raw="$2"
-  local resolved="$3"
-  local color="$4"
-  local is_broken="${5:-0}"
-  
-  local marker=""
-  if [[ "$is_broken" -eq 1 ]]; then
-    marker=" ${BOLD}${RED}[BROKEN IF MOVED]${NC}"
-  fi
-  
-  printf "${color}%s${NC} -> ${YELLOW}%s${NC} (${CYAN}resolved: %s${NC})%s\n" "$link" "$raw" "$resolved" "$marker"
-}
-export -f print_link
-export -f resolve_path
-export NC YELLOW CYAN RED GREEN BLUE PURPLE BOLD
+if [[ ! -d "$FOLDER_ABS" ]]; then
+  echo -e "${RED}Error: folder does not exist or is not a directory: ${FOLDER_ABS}${NC}" >&2
+  exit 1
+fi
 
-# ---- 1) Incoming: Symlinks from other folders to the current folder ----
+# ---- marker helper ----
+make_markers() {
+  local broken_now="${1:-0}"
+  local broken_if_moved="${2:-0}"
+  local m=""
+  if [[ "$broken_now" -eq 1 ]]; then
+    m+=" ${BOLD}${RED}[BROKEN NOW]${NC}"
+  fi
+  if [[ "$broken_if_moved" -eq 1 ]]; then
+    m+=" ${BOLD}${RED}[BROKEN IF MOVED]${NC}"
+  fi
+  printf "%b" "$m"
+}
+
+# Determine sudo prefix if needed
+sudo_prefix=()
+if [[ "$USE_SUDO" == "auto" ]]; then
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+    sudo_prefix=(sudo)
+  fi
+elif [[ "$USE_SUDO" == "no" ]]; then
+  sudo_prefix=()
+fi
+
+# ---- 1) Incoming: Symlinks from other folders into FOLDER_ABS ----
 if [[ "$DO_SYSTEM_SCAN" -eq 1 ]]; then
   if [[ -z "$FD_BIN" ]]; then
     echo -e "${YELLOW}Warning: fd/fdfind not found; skipping incoming scan.${NC}" >&2
   else
-    sudo_prefix=()
-    if [[ "$USE_SUDO" == "auto" ]]; then
-      if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
-        sudo_prefix=(sudo)
-      fi
-    fi
-
     echo -e "${BOLD}${PURPLE}== 1: Incoming Symlinks (Outside -> ${FOLDER_ABS}) ==${NC}"
-    echo -e "${CYAN}(These break because they point to this specific folder path)${NC}"
-    "${sudo_prefix[@]}" "$FD_BIN" -t l -H . "$SCAN_ROOT_ABS" \
+    echo -e "${CYAN}(These are sensitive to moving ${FOLDER_ABS}; [BROKEN NOW] means the target is missing today)${NC}"
+
+    "${sudo_prefix[@]}" "$FD_BIN" -t l -H --absolute-path . "$SCAN_ROOT_ABS" \
       -E proc -E sys -E dev -E run -E mnt -E tmp -E .git -E .cache -E node_modules \
       -x bash -c '
+        set -euo pipefail
         folder_abs="$1"; shift
-        BLUE=$'\''\e[0;34m'\''
-        YELLOW=$'\''\e[1;33m'\''
-        CYAN=$'\''\e[0;36m'\''
-        RED=$'\''\e[0;31m'\''
-        BOLD=$'\''\e[1m'\''
-        NC=$'\''\e[0m'\''
-        for link in "$@"; do
-          [[ "$link" == "$folder_abs" || "$link" == "$folder_abs"/* ]] && continue
-          
-          # We use fully resolved path to see if it eventually points to our folder
-          resolved=$(realpath -m "$link" 2>/dev/null || true)
-          [[ -z "$resolved" ]] && continue
-          
-          if [[ "$resolved" == "$folder_abs" || "$resolved" == "$folder_abs"/* ]]; then
-            raw=$(readlink "$link" || true)
-            [[ -z "$raw" ]] && continue
-            printf "${BLUE}%s${NC} -> ${YELLOW}%s${NC} (${CYAN}resolved: %s${NC}) ${BOLD}${RED}[BROKEN IF MOVED]${NC}\n" "$link" "$raw" "$resolved"
+
+        resolve_path_inner() {
+          if command -v realpath >/dev/null 2>&1; then
+            realpath -m -- "$1" 2>/dev/null || true
+          else
+            python3 - <<PY "$1" 2>/dev/null || true
+import os, sys
+print(os.path.normpath(os.path.abspath(sys.argv[1])))
+PY
           fi
+        }
+
+        make_markers_inner() {
+          broken_now="${1:-0}"
+          broken_if_moved="${2:-0}"
+          m=""
+          if [[ "$broken_now" -eq 1 ]]; then
+            m+=" \e[1m\e[0;31m[BROKEN NOW]\e[0m"
+          fi
+          if [[ "$broken_if_moved" -eq 1 ]]; then
+            m+=" \e[1m\e[0;31m[BROKEN IF MOVED]\e[0m"
+          fi
+          printf "%b" "$m"
+        }
+
+        for link in "$@"; do
+          # Skip links that are inside the folder (incoming scan is outside -> folder)
+          case "$link" in
+            "$folder_abs"|"$folder_abs"/*) continue ;;
+          esac
+
+          resolved="$(resolve_path_inner "$link")"
+          [[ -z "$resolved" ]] && continue
+
+          case "$resolved" in
+            "$folder_abs"|"$folder_abs"/*)
+              raw="$(readlink -- "$link" 2>/dev/null || true)"
+              [[ -z "$raw" ]] && continue
+
+              # Broken-now: test the symlink with -e (follows it). If target missing => false.
+              broken_now=0
+              if [[ ! -e "$link" ]]; then
+                broken_now=1
+              fi
+
+              markers="$(make_markers_inner "$broken_now" 1)"
+              printf "\e[0;34m%s\e[0m -> \e[1;33m%s\e[0m (\e[0;36mresolved: %s\e[0m)%b\n" \
+                "$link" "$raw" "$resolved" "$markers"
+              ;;
+          esac
         done
       ' bash "$FOLDER_ABS" {} +
+
     echo
   fi
 fi
 
-# ---- 2) Internal: Symlinks within the folder to other locations in the folder ----
-echo -e "${BOLD}${GREEN}== 2: Internal Symlinks (${FOLDER_ABS} -> ${FOLDER_ABS}) ==${NC}"
-echo -e "${CYAN}(Absolute internal links break; relative ones survive)${NC}"
-find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
-  raw="$(readlink -- "$link" || true)"
-  [[ -z "$raw" ]] && continue
-  
-  resolved="$(resolve_path "$link")"
+# We scan symlinks inside the folder once and classify them.
+declare -a INTERNAL_LINES=()
+declare -a EXTERNAL_LINES=()
 
-  # Category 2: Fully resolved target is INSIDE the folder
-  if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-    is_broken=0
-    if [[ "$raw" == /* ]]; then
-      # Absolute target: if it points inside FOLDER_ABS, it breaks on move
-      # We already know resolved is inside, so if raw is absolute, it is broken.
-      is_broken=1
-    fi
-    print_link "$link" "$raw" "$resolved" "$GREEN" "$is_broken"
+while IFS= read -r -d '' link; do
+  raw="$(readlink -- "$link" 2>/dev/null || true)"
+  [[ -z "$raw" ]] && continue
+
+  # Broken-now: does the symlink currently resolve to something that exists?
+  broken_now=0
+  if [[ ! -e "$link" ]]; then
+    broken_now=1
   fi
-done
-echo
 
-# ---- 3) External: Symlinks from the folder to outside locations ----
-echo -e "${BOLD}${RED}== 3: External Symlinks (${FOLDER_ABS} -> Outside) ==${NC}"
-echo -e "${CYAN}(Relative external links break; absolute ones to system paths survive)${NC}"
-find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
-  raw="$(readlink -- "$link" || true)"
-  [[ -z "$raw" ]] && continue
-
+  # Full resolution (may dereference chain)
   resolved="$(resolve_path "$link")"
 
-  # Category 3: Fully resolved target is OUTSIDE the folder
-  if [[ "$resolved" != "$FOLDER_ABS" && "$resolved" != "$FOLDER_ABS"/* ]]; then
-    is_broken=0
-    # Determine IF THE IMMEDIATE TARGET is outside
+  # Immediate target: dirname(link)+raw, lexical-normalized WITHOUT dereferencing
+  if [[ "$raw" == /* ]]; then
+    immediate_target_abs="$raw"
+  else
+    immediate_target_abs="$(normalize_noderef "$(dirname -- "$link")/$raw")"
+  fi
+
+  if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
+    # INTERNAL (eventually points inside the folder)
+    broken_if_moved=0
+    if [[ "$raw" == /* ]]; then
+      # Absolute internal targets hardcode the folder path
+      broken_if_moved=1
+    fi
+    markers="$(make_markers "$broken_now" "$broken_if_moved")"
+    INTERNAL_LINES+=(
+      "$(printf "${GREEN}%s${NC} -> ${YELLOW}%s${NC} (${CYAN}resolved: %s${NC})%b" "$link" "$raw" "$resolved" "$markers")"
+    )
+  else
+    # EXTERNAL (eventually points outside the folder)
+    broken_if_moved=0
     if [[ "$raw" != /* ]]; then
-      # Resolve ONLY the immediate target without following sub-links
-      # We use realpath -m which resolves .. but not the symlink itself
-      immediate_target_abs=$(realpath -m "$(dirname -- "$link")/$raw")
+      # Relative external link breaks if its immediate target is outside the folder
       if [[ "$immediate_target_abs" != "$FOLDER_ABS" && "$immediate_target_abs" != "$FOLDER_ABS"/* ]]; then
-        is_broken=1
+        broken_if_moved=1
       fi
     fi
-    print_link "$link" "$raw" "$resolved" "$RED" "$is_broken"
+    markers="$(make_markers "$broken_now" "$broken_if_moved")"
+    EXTERNAL_LINES+=(
+      "$(printf "${RED}%s${NC} -> ${YELLOW}%s${NC} (${CYAN}resolved: %s${NC})%b" "$link" "$raw" "$resolved" "$markers")"
+    )
   fi
-done
+done < <(find "$FOLDER_ABS" -type l -print0 2>/dev/null)
 
+# ---- 2) Internal ----
+echo -e "${BOLD}${GREEN}== 2: Internal Symlinks (${FOLDER_ABS} -> ${FOLDER_ABS}) ==${NC}"
+echo -e "${CYAN}(Absolute internal links break if moved; [BROKEN NOW] means target missing today)${NC}"
+if ((${#INTERNAL_LINES[@]} == 0)); then
+  echo -e "${YELLOW}(none)${NC}"
+else
+  printf "%b\n" "${INTERNAL_LINES[@]}"
+fi
+echo
 
+# ---- 3) External ----
+echo -e "${BOLD}${RED}== 3: External Symlinks (${FOLDER_ABS} -> Outside) ==${NC}"
+echo -e "${CYAN}(Relative external links may break if moved; [BROKEN NOW] means target missing today)${NC}"
+if ((${#EXTERNAL_LINES[@]} == 0)); then
+  echo -e "${YELLOW}(none)${NC}"
+else
+  printf "%b\n" "${EXTERNAL_LINES[@]}"
+fi
