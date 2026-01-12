@@ -159,15 +159,22 @@ echo -e "${BOLD}${GREEN}== 2: Internal Symlinks (${FOLDER_ABS} -> ${FOLDER_ABS})
 echo -e "${CYAN}(Absolute internal links break; relative ones survive)${NC}"
 find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
   raw="$(readlink -- "$link" || true)"
-  if [[ "$raw" = /* ]]; then
+  [[ -z "$raw" ]] && continue
+  
+  is_absolute=0
+  [[ "$raw" == /* ]] && is_absolute=1
+  
+  if [[ "$is_absolute" -eq 1 ]]; then
     resolved="$(resolve_path "$raw")"
-    print_link "$link" "$raw" "$resolved" "$GREEN" 1
   else
     resolved="$(resolve_path "$(dirname -- "$link")/$raw")"
-    # Relative internal link check
-    if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-      print_link "$link" "$raw" "$resolved" "$GREEN" 0
-    fi
+  fi
+
+  # Check if resolved path is INSIDE the folder
+  if [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
+    is_broken=0
+    [[ "$is_absolute" -eq 1 ]] && is_broken=1
+    print_link "$link" "$raw" "$resolved" "$GREEN" "$is_broken"
   fi
 done
 echo
@@ -177,16 +184,23 @@ echo -e "${BOLD}${RED}== 3: External Symlinks (${FOLDER_ABS} -> Outside) ==${NC}
 echo -e "${CYAN}(Relative external links break; absolute ones to system paths survive)${NC}"
 find "$FOLDER_ABS" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
   raw="$(readlink -- "$link" || true)"
-  if [[ "$raw" = /* ]]; then
+  [[ -z "$raw" ]] && continue
+
+  is_absolute=0
+  [[ "$raw" == /* ]] && is_absolute=1
+  
+  if [[ "$is_absolute" -eq 1 ]]; then
     resolved="$(resolve_path "$raw")"
-    is_broken=0 # Absolute external target survives
   else
     resolved="$(resolve_path "$(dirname -- "$link")/$raw")"
-    is_broken=1 # Relative jump to outside might fail if FOLDER moves
   fi
 
+  # Check if resolved path is OUTSIDE the folder
   if [[ "$resolved" != "$FOLDER_ABS" && "$resolved" != "$FOLDER_ABS"/* ]]; then
+    is_broken=0
+    [[ "$is_absolute" -eq 0 ]] && is_broken=1 # Relative external link breaks
     print_link "$link" "$raw" "$resolved" "$RED" "$is_broken"
   fi
 done
+
 
