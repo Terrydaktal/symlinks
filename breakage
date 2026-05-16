@@ -177,148 +177,108 @@ display_line() {
 }
 
 # =========================
-# 1) Absolute Path Matches
+# Search Process
 # =========================
-echo -e "${BOLD}${BLUE}1) Absolute path references${NC}"
-HAS_ABS=0
-declare -A SEEN_ABS=()
+declare -A FILE_COUNTS=()
+declare -A SEEN_LINES=()
 
+# 1) Absolute Path Matches
 if [[ -n "$RG_BIN" ]]; then
-  # IMPORTANT: put include globs first, exclude globs last (rg is last-match-wins)
   RG_ABS_ARGS=("--color=never" "--no-messages" "--fixed-strings" "--vimgrep")
   [[ "$USE_FILTER" -eq 1 ]] && RG_ABS_ARGS+=("-g" "$SRC_GLOBS_RG")
   RG_ABS_ARGS+=("${RG_EXCLUDE_FLAGS[@]}")
 
   while IFS=: read -r file line_num _ line_content; do
     [[ -z "${file:-}" ]] && continue
-
-    # Deduplicate by file:line (avoids duplicates when multiple -e patterns hit same line)
     key="$file:$line_num"
-    [[ -n "${SEEN_ABS[$key]:-}" ]] && continue
-    SEEN_ABS[$key]=1
-
-    # Skip if this script itself appears in results (when searching widely)
-    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
-      continue
-    fi
-
-    HAS_ABS=1
-    patt="$FOLDER_ABS"
-    [[ -n "$FOLDER_HOME_ALT" && "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
-    snippet="$(display_line "$line_content" "$patt")"
-    echo -e "${GREEN}$file:$line_num${NC}: $snippet"
+    [[ -n "${SEEN_LINES[$key]:-}" ]] || [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]] && continue
+    SEEN_LINES[$key]=1
+    FILE_COUNTS["$file"]=$(( ${FILE_COUNTS["$file"]:-0} + 1 ))
   done < <("${SUDO_CMD[@]}" "$RG_BIN" "${RG_ABS_ARGS[@]}" -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" 2>/dev/null || true)
 else
-  # Grep fallback: implement filtering via multiple --include patterns (grep doesn't understand brace globs)
   GREP_ABS_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=never" "-F")
-  if [[ "$USE_FILTER" -eq 1 ]]; then
-    for ext in "${SRC_EXTS_GREP[@]}"; do
-      GREP_ABS_ARGS+=("--include=*.${ext}")
-    done
-  fi
+  [[ "$USE_FILTER" -eq 1 ]] && { for ext in "${SRC_EXTS_GREP[@]}"; do GREP_ABS_ARGS+=("--include=*.${ext}"); done; }
 
   while IFS=: read -r file line_num line_content; do
     [[ -z "${file:-}" ]] && continue
-
     key="$file:$line_num"
-    [[ -n "${SEEN_ABS[$key]:-}" ]] && continue
-    SEEN_ABS[$key]=1
-
-    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
-      continue
-    fi
-
-    HAS_ABS=1
-    patt="$FOLDER_ABS"
-    [[ -n "$FOLDER_HOME_ALT" && "$line_content" == *"$FOLDER_HOME_ALT"* ]] && patt="$FOLDER_HOME_ALT"
-    snippet="$(display_line "$line_content" "$patt")"
-    echo -e "${GREEN}$file:$line_num${NC}: $snippet"
+    [[ -n "${SEEN_LINES[$key]:-}" ]] || [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]] && continue
+    SEEN_LINES[$key]=1
+    FILE_COUNTS["$file"]=$(( ${FILE_COUNTS["$file"]:-0} + 1 ))
   done < <("${SUDO_CMD[@]}" grep "${GREP_ABS_ARGS[@]}" -e "$FOLDER_ABS" ${FOLDER_HOME_ALT:+-e "$FOLDER_HOME_ALT"} "$SEARCH_PATH" 2>/dev/null || true)
 fi
 
-[[ $HAS_ABS -eq 0 ]] && echo -e "${YELLOW}No absolute path matches found.${NC}"
-
-echo
-echo -e "${BOLD}${BLUE}2) Confirmed relative references to '${FOLDER_NAME}'${NC}"
-echo -e "${CYAN}(Verifying if paths actually resolve to the target directory)${NC}"
-
+# 2) Confirmed Relative References
 process_hit() {
-  local file="$1" line_num="$2" line_content="$3"
-
+  local file="$1" line_content="$2"
   local file_dir
   file_dir="$(dirname -- "$file")"
   file_dir="$(resolve_path "$file_dir")"
-
   local potentials
   potentials="$(printf "%s" "$line_content" | python3 "$PY_HELPER" extract "$FOLDER_NAME" 2>/dev/null || true)"
-
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
-
     if [[ "$p" == "$FOLDER_NAME" ]]; then
       local has_slash=0 is_quoted=0
       [[ "$line_content" == *"/"* ]] && has_slash=1
       [[ "$line_content" == *"'$FOLDER_NAME'"* || "$line_content" == *"\"$FOLDER_NAME\""* ]] && is_quoted=1
       [[ $has_slash -eq 0 && $is_quoted -eq 0 ]] && continue
     fi
-
     local resolved=""
-    if [[ "$p" == "~/"* ]]; then
-      resolved="$(resolve_path "${p/#\~/$HOME}")"
-    elif [[ "$p" == /* ]]; then
-      resolved="$(resolve_path "$p")"
-    else
-      resolved="$(resolve_path "$file_dir/$p")"
-    fi
-
-    if [[ -n "$resolved" ]] && [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then
-      local snippet
-      snippet="$(display_line "$line_content" "$p")"
-      echo -e "${GREEN}$file:$line_num${NC}: $snippet ${BOLD}${GREEN}[CONFIRMED]${NC} (via: $p)"
-      break
-    fi
+    if [[ "$p" == "~/"* ]]; then resolved="$(resolve_path "${p/#\~/$HOME}")"
+    elif [[ "$p" == /* ]]; then resolved="$(resolve_path "$p")"
+    else resolved="$(resolve_path "$file_dir/$p")"; fi
+    if [[ -n "$resolved" ]] && [[ "$resolved" == "$FOLDER_ABS" || "$resolved" == "$FOLDER_ABS"/* ]]; then return 0; fi
   done <<< "$potentials"
+  return 1
 }
 
 MAX_HITS=5000
 hit_count=0
-
 if [[ -n "$RG_BIN" ]]; then
-  # IMPORTANT: include first, exclude last (last-match-wins)
   RG_REL_ARGS=("--color=never" "--no-messages" "-w" "$FOLDER_NAME" "--vimgrep" "--glob" "!**/${FOLDER_NAME}/**")
   [[ "$USE_FILTER" -eq 1 ]] && RG_REL_ARGS+=("-g" "$SRC_GLOBS_RG")
   RG_REL_ARGS+=("${RG_EXCLUDE_FLAGS[@]}")
-
   while IFS=: read -r file line_num _ line_content; do
     [[ -z "${file:-}" ]] && continue
-
-    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
-      continue
-    fi
-
-    process_hit "$file" "$line_num" "$line_content"
+    [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]] && continue
     ((hit_count += 1))
     [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
+    key="$file:$line_num"
+    [[ -n "${SEEN_LINES[$key]:-}" ]] && continue
+    if process_hit "$file" "$line_content"; then
+      SEEN_LINES[$key]=1
+      FILE_COUNTS["$file"]=$(( ${FILE_COUNTS["$file"]:-0} + 1 ))
+    fi
   done < <("${SUDO_CMD[@]}" "$RG_BIN" "${RG_REL_ARGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
 else
   GREP_REL_ARGS=("${GREP_EXCLUDE_FLAGS[@]}" "-rn" "--color=never" "-w" "$FOLDER_NAME" "--exclude-dir=$FOLDER_NAME")
-  if [[ "$USE_FILTER" -eq 1 ]]; then
-    for ext in "${SRC_EXTS_GREP[@]}"; do
-      GREP_REL_ARGS+=("--include=*.${ext}")
-    done
-  fi
-
+  [[ "$USE_FILTER" -eq 1 ]] && { for ext in "${SRC_EXTS_GREP[@]}"; do GREP_REL_ARGS+=("--include=*.${ext}"); done; }
   while IFS=: read -r file line_num line_content; do
     [[ -z "${file:-}" ]] && continue
-
-    if [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]]; then
-      continue
-    fi
-
-    process_hit "$file" "$line_num" "$line_content"
+    [[ "$(resolve_path "$file")" == "$(resolve_path "$0")" ]] && continue
     ((hit_count += 1))
     [[ $hit_count -ge $MAX_HITS ]] && { echo -e "${YELLOW}Warning: Hit limit reached ($MAX_HITS).${NC}" >&2; break; }
+    key="$file:$line_num"
+    [[ -n "${SEEN_LINES[$key]:-}" ]] && continue
+    if process_hit "$file" "$line_content"; then
+      SEEN_LINES[$key]=1
+      FILE_COUNTS["$file"]=$(( ${FILE_COUNTS["$file"]:-0} + 1 ))
+    fi
   done < <("${SUDO_CMD[@]}" grep "${GREP_REL_ARGS[@]}" "$SEARCH_PATH" 2>/dev/null || true)
+fi
+
+# =========================
+# Results Summary
+# =========================
+echo -e "${BOLD}${BLUE}== Breakage Results ==${NC}"
+if [[ ${#FILE_COUNTS[@]} -gt 0 ]]; then
+  readarray -t sorted_files < <(printf '%s\n' "${!FILE_COUNTS[@]}" | sort)
+  for file in "${sorted_files[@]}"; do
+    echo -e "${GREEN}$file${NC} [${FILE_COUNTS[$file]}]"
+  done
+else
+  echo -e "${YELLOW}No potential breakages found.${NC}"
 fi
 
 echo
