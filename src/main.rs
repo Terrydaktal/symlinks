@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use walkdir::WalkDir;
 
 const RED: &str = "\x1b[0;31m";
@@ -51,6 +51,10 @@ struct Cli {
     /// Show only external links.
     #[arg(long)]
     external: bool,
+
+    /// Repoint internal symlinks to a new base directory.
+    #[arg(long)]
+    repoint: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -252,6 +256,87 @@ fn is_excluded_dir_name(name: &str) -> bool {
     )
 }
 
+#[cfg(unix)]
+fn replace_symlink(link: &Path, new_target: &Path) -> Result<(), String> {
+    let parent = link
+        .parent()
+        .ok_or_else(|| format!("symlink has no parent directory: {}", link.display()))?;
+    let base_name = link
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("link");
+    let pid = std::process::id();
+
+    for attempt in 0u32..1024 {
+        let tmp = parent.join(format!(".{}.symlinks-repoint-{}-{}", base_name, pid, attempt));
+        if tmp.exists() {
+            continue;
+        }
+        symlink(new_target, &tmp).map_err(|e| {
+            format!(
+                "failed to create temporary symlink {} -> {}: {}",
+                tmp.display(),
+                new_target.display(),
+                e
+            )
+        })?;
+        match fs::rename(&tmp, link) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(format!(
+                    "failed to replace symlink {} -> {}: {}",
+                    link.display(),
+                    new_target.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "unable to allocate a temporary name near {}",
+        link.display()
+    ))
+}
+
+#[cfg(unix)]
+fn repoint_symlinks(folder_abs: &Path, new_base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let new_base_abs = abs_clean(new_base);
+    let mut changes = Vec::new();
+
+    for entry_result in WalkDir::new(folder_abs).follow_links(false) {
+        let entry = match entry_result {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().is_symlink() {
+            continue;
+        }
+
+        let link = entry.path().to_path_buf();
+        let resolved = resolve_path(&link);
+        if !is_inside(&resolved, folder_abs) {
+            continue;
+        }
+
+        let suffix = match resolved.strip_prefix(folder_abs) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let new_target = new_base_abs.join(suffix);
+        if new_target == resolved {
+            continue;
+        }
+
+        replace_symlink(&link, &new_target)?;
+        changes.push((link, new_target));
+    }
+
+    Ok(changes)
+}
+
 fn collect_internal_external(folder_abs: &Path, ls_colors: &LsColors) -> (Vec<String>, Vec<String>) {
     let mut internal_lines = Vec::new();
     let mut external_lines = Vec::new();
@@ -448,7 +533,7 @@ fn main() {
     let do_internal = if section_selected { cli.internal } else { true };
     let do_external = if section_selected { cli.external } else { true };
 
-    if maybe_rerun_with_sudo(&cli, do_incoming) {
+    if cli.repoint.is_none() && maybe_rerun_with_sudo(&cli, do_incoming) {
         return;
     }
 
@@ -462,6 +547,35 @@ fn main() {
     }
 
     let scan_root_abs = resolve_path(&cli.root);
+
+    if let Some(new_base) = cli.repoint.as_ref() {
+        match repoint_symlinks(&folder_abs, new_base) {
+            Ok(changes) => {
+                println!(
+                    "{BOLD}{PURPLE}== Repointed Symlinks ({} -> {}) =={NC}",
+                    folder_abs.display(),
+                    abs_clean(new_base).display()
+                );
+                if changes.is_empty() {
+                    println!("{YELLOW}(none){NC}");
+                } else {
+                    for (link, target) in changes {
+                        println!(
+                            "{GREEN}{}{NC} -> {YELLOW}{}{NC}",
+                            link.display(),
+                            target.display()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{RED}Error: {e}{NC}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if do_incoming && !cli.no_system_scan {
         if cli.no_sudo {
             // Compatibility flag retained from shell version; scanning remains best-effort.
