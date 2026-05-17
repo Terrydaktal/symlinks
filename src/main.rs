@@ -52,7 +52,7 @@ struct Cli {
     #[arg(long)]
     external: bool,
 
-    /// Repoint internal symlinks to a new base directory.
+    /// Repoint symlinks that resolve inside the folder to a new base directory.
     #[arg(long)]
     repoint: Option<PathBuf>,
 }
@@ -337,6 +337,57 @@ fn repoint_symlinks(folder_abs: &Path, new_base: &Path) -> Result<Vec<(PathBuf, 
     Ok(changes)
 }
 
+#[cfg(unix)]
+fn repoint_incoming_symlinks(
+    folder_abs: &Path,
+    new_base: &Path,
+    scan_root_abs: &Path,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let new_base_abs = abs_clean(new_base);
+    let mut changes = Vec::new();
+    let mut iter = WalkDir::new(scan_root_abs).follow_links(false).into_iter();
+
+    while let Some(entry_result) = iter.next() {
+        let entry = match entry_result {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if entry.file_type().is_dir() {
+            if let Some(name) = entry.file_name().to_str() {
+                if is_excluded_dir_name(name) {
+                    iter.skip_current_dir();
+                    continue;
+                }
+            }
+        }
+
+        if !entry.file_type().is_symlink() {
+            continue;
+        }
+
+        let link = entry.path().to_path_buf();
+        let resolved = resolve_path(&link);
+        if !is_inside(&resolved, folder_abs) {
+            continue;
+        }
+
+        let suffix = match resolved.strip_prefix(folder_abs) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let new_target = new_base_abs.join(suffix);
+        if new_target == resolved {
+            continue;
+        }
+
+        replace_symlink(&link, &new_target)?;
+        changes.push((link, new_target));
+    }
+
+    Ok(changes)
+}
+
 fn collect_internal_external(folder_abs: &Path, ls_colors: &LsColors) -> (Vec<String>, Vec<String>) {
     let mut internal_lines = Vec::new();
     let mut external_lines = Vec::new();
@@ -549,28 +600,38 @@ fn main() {
     let scan_root_abs = resolve_path(&cli.root);
 
     if let Some(new_base) = cli.repoint.as_ref() {
+        let mut changes = Vec::new();
+
         match repoint_symlinks(&folder_abs, new_base) {
-            Ok(changes) => {
-                println!(
-                    "{BOLD}{PURPLE}== Repointed Symlinks ({} -> {}) =={NC}",
-                    folder_abs.display(),
-                    abs_clean(new_base).display()
-                );
-                if changes.is_empty() {
-                    println!("{YELLOW}(none){NC}");
-                } else {
-                    for (link, target) in changes {
-                        println!(
-                            "{GREEN}{}{NC} -> {YELLOW}{}{NC}",
-                            link.display(),
-                            target.display()
-                        );
-                    }
-                }
-            }
+            Ok(mut local_changes) => changes.append(&mut local_changes),
             Err(e) => {
                 eprintln!("{RED}Error: {e}{NC}");
                 std::process::exit(1);
+            }
+        }
+
+        match repoint_incoming_symlinks(&folder_abs, new_base, &scan_root_abs) {
+            Ok(mut incoming_changes) => changes.append(&mut incoming_changes),
+            Err(e) => {
+                eprintln!("{RED}Error: {e}{NC}");
+                std::process::exit(1);
+            }
+        }
+
+        println!(
+            "{BOLD}{PURPLE}== Repointed Symlinks ({} -> {}) =={NC}",
+            folder_abs.display(),
+            abs_clean(new_base).display()
+        );
+        if changes.is_empty() {
+            println!("{YELLOW}(none){NC}");
+        } else {
+            for (link, target) in changes {
+                println!(
+                    "{GREEN}{}{NC} -> {YELLOW}{}{NC}",
+                    link.display(),
+                    target.display()
+                );
             }
         }
         return;
