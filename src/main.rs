@@ -3,6 +3,7 @@ use glob::Pattern;
 use path_clean::PathClean;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
@@ -301,7 +302,7 @@ fn replace_symlink(link: &Path, new_target: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn repoint_symlinks(folder_abs: &Path, new_base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+fn plan_repoint_symlinks(folder_abs: &Path, new_base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let new_base_abs = abs_clean(new_base);
     let mut changes = Vec::new();
 
@@ -330,7 +331,6 @@ fn repoint_symlinks(folder_abs: &Path, new_base: &Path) -> Result<Vec<(PathBuf, 
             continue;
         }
 
-        replace_symlink(&link, &new_target)?;
         changes.push((link, new_target));
     }
 
@@ -338,7 +338,7 @@ fn repoint_symlinks(folder_abs: &Path, new_base: &Path) -> Result<Vec<(PathBuf, 
 }
 
 #[cfg(unix)]
-fn repoint_incoming_symlinks(
+fn plan_repoint_incoming_symlinks(
     folder_abs: &Path,
     new_base: &Path,
     scan_root_abs: &Path,
@@ -381,11 +381,37 @@ fn repoint_incoming_symlinks(
             continue;
         }
 
-        replace_symlink(&link, &new_target)?;
         changes.push((link, new_target));
     }
 
     Ok(changes)
+}
+
+#[cfg(unix)]
+fn apply_repoint_changes(changes: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    for (link, target) in changes {
+        replace_symlink(link, target)?;
+    }
+    Ok(())
+}
+
+fn prompt_confirm(prompt: &str) -> Result<bool, String> {
+    if !io::stdin().is_terminal() {
+        return Err("repoint mode requires an interactive terminal for confirmation".to_string());
+    }
+
+    print!("{prompt} [Y/n] ");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("failed to flush prompt: {e}"))?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("failed to read confirmation: {e}"))?;
+
+    let trimmed = input.trim();
+    Ok(trimmed.is_empty() || trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
 }
 
 fn collect_internal_external(folder_abs: &Path, ls_colors: &LsColors) -> (Vec<String>, Vec<String>) {
@@ -602,7 +628,7 @@ fn main() {
     if let Some(new_base) = cli.repoint.as_ref() {
         let mut changes = Vec::new();
 
-        match repoint_symlinks(&folder_abs, new_base) {
+        match plan_repoint_symlinks(&folder_abs, new_base) {
             Ok(mut local_changes) => changes.append(&mut local_changes),
             Err(e) => {
                 eprintln!("{RED}Error: {e}{NC}");
@@ -610,7 +636,7 @@ fn main() {
             }
         }
 
-        match repoint_incoming_symlinks(&folder_abs, new_base, &scan_root_abs) {
+        match plan_repoint_incoming_symlinks(&folder_abs, new_base, &scan_root_abs) {
             Ok(mut incoming_changes) => changes.append(&mut incoming_changes),
             Err(e) => {
                 eprintln!("{RED}Error: {e}{NC}");
@@ -618,21 +644,54 @@ fn main() {
             }
         }
 
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+
         println!(
-            "{BOLD}{PURPLE}== Repointed Symlinks ({} -> {}) =={NC}",
+            "{BOLD}{PURPLE}== Repoint Preview ({} -> {}) =={NC}",
             folder_abs.display(),
             abs_clean(new_base).display()
         );
         if changes.is_empty() {
             println!("{YELLOW}(none){NC}");
+            return;
         } else {
-            for (link, target) in changes {
+            for (link, target) in &changes {
                 println!(
                     "{GREEN}{}{NC} -> {YELLOW}{}{NC}",
                     link.display(),
                     target.display()
                 );
             }
+        }
+
+        match prompt_confirm("Apply these changes?") {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("{YELLOW}Aborted.{NC}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("{RED}Error: {e}{NC}");
+                std::process::exit(1);
+            }
+        }
+
+        if let Err(e) = apply_repoint_changes(&changes) {
+            eprintln!("{RED}Error: {e}{NC}");
+            std::process::exit(1);
+        }
+
+        println!(
+            "{BOLD}{PURPLE}== Repointed Symlinks ({} -> {}) =={NC}",
+            folder_abs.display(),
+            abs_clean(new_base).display()
+        );
+        for (link, target) in changes {
+            println!(
+                "{GREEN}{}{NC} -> {YELLOW}{}{NC}",
+                link.display(),
+                target.display()
+            );
         }
         return;
     }
